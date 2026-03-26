@@ -58,11 +58,15 @@ function Get-TabCommand($tab) {
             } else {
                 $claudeCmd += ' --continue'
             }
-            # Restore model and permission mode
+            # Restore model
             if ($tab.model -and $tab.model -ne '<synthetic>') {
                 $claudeCmd += " --model $($tab.model)"
             }
-            if ($tab.permissionMode -and $tab.permissionMode -ne 'default') {
+            # Restore permission mode — use --dangerously-skip-permissions for bypass mode
+            # to avoid the workspace trust dialog (fixes #2)
+            if ($tab.permissionMode -eq 'bypassPermissions') {
+                $claudeCmd += " --dangerously-skip-permissions"
+            } elseif ($tab.permissionMode -and $tab.permissionMode -ne 'default') {
                 $claudeCmd += " --permission-mode $($tab.permissionMode)"
             }
             # Restore session name
