@@ -192,6 +192,14 @@ powershell -ExecutionPolicy Bypass -File .\Uninstall.ps1
 
 Removes shortcuts and startup entry. Your saved sessions in `saves/` are kept.
 
+## Known Limitations
+
+**Multiple virtual desktops**: Save captures all windows across all desktops, but does not currently record which desktop each window belongs to. Restore opens everything on the current desktop. See [ROADMAP.md](ROADMAP.md) for planned virtual desktop support.
+
+**Single monitor assumed for positioning**: Window coordinates are saved as absolute pixel values. If you restore on a different monitor setup (e.g., docked vs undocked laptop), windows may appear off-screen. Increase `restoreDelayMs` and manually reposition.
+
+**SSH key/password prompts**: SSH sessions are reconnected by re-running the saved command. If the original session used a password prompt or agent-forwarded key that's no longer available, the restore will hang waiting for input.
+
 ## Troubleshooting
 
 | Issue | Fix |
