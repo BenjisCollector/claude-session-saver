@@ -18,7 +18,10 @@ Claude Session Saver sits quietly in your system tray (bottom-right notification
 - **Claude Code sessions** — resumes conversations with full context via `claude --resume`
 - **SSH sessions** — reconnects to remote servers automatically
 - **Plain tabs** — reopens PowerShell/cmd tabs at their working directories
+- **Model and mode** — saves which Claude model (opus, sonnet, haiku) and permission mode (plan, default, etc.) each session was using, and restores them
+- **Session names** — preserves `--name` labels so your restored sessions keep their titles
 - **System tray** — lives in the hidden icons area, out of your way
+- **Auto-save** — configurable timer (default: every 5 minutes) so you never lose your setup
 - **Snapshot history** — keeps your last 10 saves with timestamps
 - **Toast notifications** — quick confirmation when saving
 - **Zero dependencies** — pure PowerShell + built-in Windows APIs
@@ -93,7 +96,9 @@ Each save creates a timestamped JSON snapshot in the `saves/` folder:
           "type": "claude",
           "cwd": "C:\\Users\\you\\my-project",
           "sessionId": "a26b1898-799d-4448-b8b7-7775dcf6babb",
-          "sessionName": "feature-auth"
+          "sessionName": "feature-auth",
+          "model": "claude-opus-4-6",
+          "permissionMode": "bypassPermissions"
         },
         {
           "type": "ssh",
@@ -113,7 +118,7 @@ Each save creates a timestamped JSON snapshot in the `saves/` folder:
 
 | Type | How it's detected | What's saved | How it's restored |
 |------|------------------|-------------|-------------------|
-| `claude` | Node.js child process running Claude CLI | Session ID, working directory, session name | `claude --resume <sessionId>` |
+| `claude` | Node.js child process running Claude CLI | Session ID, working directory, session name, model, permission mode | `claude --resume <sessionId> --model <model> --permission-mode <mode>` |
 | `ssh` | SSH process in tab | Full SSH command line | Re-runs the SSH command |
 | `powershell` | Default PowerShell/cmd/bash | Working directory | Opens tab at saved directory |
 | `other` | Anything else | Command line, working directory | Opens tab at saved directory |
@@ -124,14 +129,15 @@ Each save creates a timestamped JSON snapshot in the `saves/` folder:
 Save flow:
   Windows Terminal process
     -> EnumWindows (user32.dll) -> window positions & sizes
-    -> Process tree walk (WMI) -> OpenConsole -> shell -> child processes
+    -> Process tree walk (WMI) -> shell -> child processes
     -> Claude session files (~/.claude/sessions/*.json) -> session IDs
+    -> Conversation JSONL (~/.claude/projects/) -> model, permissionMode, real CWD
     -> JSON snapshot
 
 Restore flow:
   JSON snapshot
     -> wt.exe new-tab -d <dir> -> opens tabs at saved directories
-    -> claude --resume <id> -> resumes conversations
+    -> claude --resume <id> --model <m> --permission-mode <p> -> resumes with full state
     -> SetWindowPos (user32.dll) -> positions windows on screen
 ```
 
@@ -166,7 +172,8 @@ Edit `config.json`:
 {
   "maxSaves": 10,
   "restoreDelayMs": 1500,
-  "enableToastNotifications": true
+  "enableToastNotifications": true,
+  "autoSaveMinutes": 5
 }
 ```
 
@@ -175,6 +182,7 @@ Edit `config.json`:
 | `maxSaves` | `10` | Number of timestamped snapshots to keep |
 | `restoreDelayMs` | `1500` | Delay (ms) between opening windows. Increase to 2000-2500 on slower machines |
 | `enableToastNotifications` | `true` | Show Windows toast notification after saving |
+| `autoSaveMinutes` | `5` | Auto-save interval in minutes. The tray app saves automatically when WT is running. Toggle on/off via tray menu |
 
 ## Uninstall
 

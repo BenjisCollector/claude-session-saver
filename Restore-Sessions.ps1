@@ -41,10 +41,22 @@ function Get-TabCommand($tab) {
     switch ($tab.type) {
         "claude" {
             $cwd = Test-Cwd $tab.cwd
-            if ($tab.sessionId) {
-                return @{ cwd = $cwd; cmd = "claude --resume $($tab.sessionId)" }
+            $claudeCmd = 'claude'
+            if ($tab.sessionId) { $claudeCmd += " --resume $($tab.sessionId)" }
+            else { $claudeCmd += ' --continue' }
+            # Restore model and permission mode
+            if ($tab.model -and $tab.model -ne '<synthetic>') {
+                $claudeCmd += " --model $($tab.model)"
             }
-            return @{ cwd = $cwd; cmd = "claude --continue" }
+            if ($tab.permissionMode -and $tab.permissionMode -ne 'default') {
+                $claudeCmd += " --permission-mode $($tab.permissionMode)"
+            }
+            # Restore session name
+            if ($tab.sessionName) {
+                $safeName = $tab.sessionName -replace "'", "''"
+                $claudeCmd += " --name '$safeName'"
+            }
+            return @{ cwd = $cwd; cmd = $claudeCmd }
         }
         "ssh" {
             if ($tab.commandLine) {

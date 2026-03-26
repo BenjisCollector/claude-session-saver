@@ -97,10 +97,12 @@ foreach ($shell in $shells) {
     }
     elseif ($name -match "powershell|pwsh|cmd|bash") {
         $children = $shellChildren | Where-Object { $_.ParentProcessId -eq $shell.ProcessId }
-        $claudeChild = $children | Where-Object { $_.Name -eq "node.exe" -and $_.CommandLine -match "claude" }
+        $claudeChildren = @($children | Where-Object { $_.Name -eq "node.exe" -and $_.CommandLine -match "claude" })
 
-        if ($claudeChild) {
+        if ($claudeChildren.Count -gt 0) {
             $tab.type = "claude"
+            # Use the first (primary) Claude child process
+            $claudeChild = $claudeChildren[0]
             $sessionFile = Join-Path $claudeSessionsDir "$($claudeChild.ProcessId).json"
             if (Test-Path $sessionFile) {
                 try {
@@ -108,7 +110,6 @@ foreach ($shell in $shells) {
                     # Fix malformed JSON: some session files have }"name":... outside the object
                     if ($raw -match '^\{.*?\}') {
                         $jsonPart = $Matches[0]
-                        # Extract any trailing name field
                         $trailingName = $null
                         if ($raw -match '\}"name":"([^"]+)"') { $trailingName = $Matches[1] }
                         $s = $jsonPart | ConvertFrom-Json
@@ -118,6 +119,36 @@ foreach ($shell in $shells) {
                         elseif ($trailingName) { $tab["sessionName"] = $trailingName }
                     }
                 } catch { }
+            }
+
+            # Read model and permissionMode from conversation JSONL
+            if ($tab.sessionId) {
+                $claudeProjectsDir = Join-Path $env:USERPROFILE ".claude\projects"
+                $jsonlFile = $null
+                if (Test-Path $claudeProjectsDir) {
+                    $jsonlFile = Get-ChildItem -Path $claudeProjectsDir -Recurse -Filter "$($tab.sessionId).jsonl" -ErrorAction SilentlyContinue | Select-Object -First 1
+                }
+                if ($jsonlFile) {
+                    # Derive real project CWD from JSONL parent folder name
+                    # Folder names like "C--Users-buste-ShotIQ" decode to "C:\Users\buste\ShotIQ"
+                    $projFolder = $jsonlFile.Directory.Name
+                    $projPath = $projFolder -replace '--', ':\' -replace '-', '\'
+                    if (Test-Path $projPath) { $tab.cwd = $projPath }
+
+                    # Read last model and permissionMode from the JSONL (tail approach for speed)
+                    try {
+                        $tailLines = Get-Content $jsonlFile.FullName -Tail 50 -ErrorAction SilentlyContinue
+                        $tailText = $tailLines -join "`n"
+                        $modelMatches = [regex]::Matches($tailText, '"model":"([^"]+)"')
+                        if ($modelMatches.Count -gt 0) {
+                            $tab["model"] = $modelMatches[$modelMatches.Count - 1].Groups[1].Value
+                        }
+                        $permMatches = [regex]::Matches($tailText, '"permissionMode":"([^"]+)"')
+                        if ($permMatches.Count -gt 0) {
+                            $tab["permissionMode"] = $permMatches[$permMatches.Count - 1].Groups[1].Value
+                        }
+                    } catch { }
+                }
             }
         }
 
@@ -211,10 +242,12 @@ foreach ($win in $windows) {
     $w = @{ position = $win.Position; title = $win.Title; tabs = @() }
     foreach ($tab in $win.Tabs) {
         $t = @{ type = $tab.type }
-        if ($tab.cwd)         { $t.cwd = $tab.cwd }
-        if ($tab.sessionId)   { $t.sessionId = $tab.sessionId }
-        if ($tab.sessionName) { $t.sessionName = $tab.sessionName }
-        if ($tab.commandLine) { $t.commandLine = $tab.commandLine }
+        if ($tab.cwd)            { $t.cwd = $tab.cwd }
+        if ($tab.sessionId)      { $t.sessionId = $tab.sessionId }
+        if ($tab.sessionName)    { $t.sessionName = $tab.sessionName }
+        if ($tab.model)          { $t.model = $tab.model }
+        if ($tab.permissionMode) { $t.permissionMode = $tab.permissionMode }
+        if ($tab.commandLine)    { $t.commandLine = $tab.commandLine }
         $w.tabs += $t
     }
     $output.windows += $w
