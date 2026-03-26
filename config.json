@@ -1,0 +1,5 @@
+{
+  "maxSaves": 10,
+  "restoreDelayMs": 1500,
+  "enableToastNotifications": true
+}
