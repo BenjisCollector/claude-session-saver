@@ -35,17 +35,48 @@ $lnk.Description = 'Restore saved terminal windows and Claude Code sessions'
 $lnk.Save()
 Write-Host '  [OK] Start Menu: Restore Claude Sessions' -ForegroundColor Green
 
-# 2. Add tray app to Windows startup
+# 2. Add tray app via Scheduled Task (faster than Startup folder)
 
-$startupDir = [System.IO.Path]::Combine($env:APPDATA, 'Microsoft\Windows\Start Menu\Programs\Startup')
-$lnk = $WshShell.CreateShortcut([System.IO.Path]::Combine($startupDir, 'Claude Session Saver.lnk'))
-$lnk.TargetPath = 'powershell.exe'
-$lnk.Arguments = ('-ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f [System.IO.Path]::Combine($root, 'SessionSaver.ps1'))
-$lnk.WorkingDirectory = $root
-$lnk.IconLocation = 'shell32.dll,258'
-$lnk.Description = 'Claude Session Saver tray app'
-$lnk.Save()
-Write-Host '  [OK] Startup: System tray app (runs on login)' -ForegroundColor Green
+$taskName = 'ClaudeSessionSaverTray'
+$trayScript = [System.IO.Path]::Combine($root, 'SessionSaver.ps1')
+
+# Remove old Startup folder shortcut if it exists (migration from v1.0)
+$oldStartupLnk = [System.IO.Path]::Combine($env:APPDATA, 'Microsoft\Windows\Start Menu\Programs\Startup\Claude Session Saver.lnk')
+if (Test-Path $oldStartupLnk) {
+    Remove-Item $oldStartupLnk -Force
+    Write-Host '  [OK] Removed old Startup folder shortcut (migrated to Scheduled Task)' -ForegroundColor DarkGray
+}
+
+# Remove existing task if present (idempotent install)
+$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existing) {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+}
+
+$action = New-ScheduledTaskAction `
+    -Execute 'powershell.exe' `
+    -Argument ('-ExecutionPolicy Bypass -WindowStyle Hidden -File "{0}"' -f $trayScript) `
+    -WorkingDirectory $root
+
+$trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+
+$settings = New-ScheduledTaskSettingsSet `
+    -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries `
+    -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -RestartCount 3 `
+    -RestartInterval ([TimeSpan]::FromMinutes(1)) `
+    -Priority 4
+
+Register-ScheduledTask `
+    -TaskName $taskName `
+    -Action $action `
+    -Trigger $trigger `
+    -Settings $settings `
+    -Description 'Claude Session Saver system tray app' `
+    -RunLevel Limited | Out-Null
+
+Write-Host '  [OK] Scheduled Task: tray app starts on login (faster than Startup folder)' -ForegroundColor Green
 
 # 3. Enable Windows Terminal tab persistence as fallback
 
@@ -89,7 +120,6 @@ Write-Host ''
 # Launch tray app now
 
 Write-Host '  Starting tray app...' -ForegroundColor DarkGray
-$trayPath = Join-Path $root 'SessionSaver.ps1'
-Start-Process -FilePath 'powershell.exe' -ArgumentList @('-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $trayPath) -WindowStyle Hidden
+Start-Process -FilePath 'powershell.exe' -ArgumentList @('-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $trayScript) -WindowStyle Hidden
 Write-Host '  [OK] Tray app running' -ForegroundColor Green
 Write-Host ''

@@ -15,6 +15,14 @@ Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
     $_.CommandLine -match "SessionSaver\.ps1"
 } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
 
+# Remove Scheduled Task (v1.0.1+)
+$taskName = 'ClaudeSessionSaverTray'
+$existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existing) {
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    Write-Host "  [OK] Removed: Scheduled Task ($taskName)" -ForegroundColor Green
+}
+
 $files = @(
     "$startMenu\Save Claude Sessions.lnk",
     "$startMenu\Restore Claude Sessions.lnk",
