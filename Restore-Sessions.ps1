@@ -42,8 +42,21 @@ function Get-TabCommand($tab) {
         "claude" {
             $cwd = Test-Cwd $tab.cwd
             $claudeCmd = 'claude'
-            if ($tab.sessionId) { $claudeCmd += " --resume $($tab.sessionId)" }
-            else { $claudeCmd += ' --continue' }
+            # Check if session file still exists, fall back to --continue
+            if ($tab.sessionId) {
+                $sessionDir = Join-Path $env:USERPROFILE ".claude\projects"
+                $jsonlExists = $false
+                if (Test-Path $sessionDir) {
+                    $jsonlExists = [bool](Get-ChildItem -Path $sessionDir -Recurse -Filter "$($tab.sessionId).jsonl" -ErrorAction SilentlyContinue | Select-Object -First 1)
+                }
+                if ($jsonlExists) {
+                    $claudeCmd += " --resume $($tab.sessionId)"
+                } else {
+                    $claudeCmd += ' --continue'
+                }
+            } else {
+                $claudeCmd += ' --continue'
+            }
             # Restore model and permission mode
             if ($tab.model -and $tab.model -ne '<synthetic>') {
                 $claudeCmd += " --model $($tab.model)"
@@ -81,6 +94,24 @@ if (-not (Test-Path $latestPath)) {
 }
 
 $session = Get-Content $latestPath -Raw | ConvertFrom-Json
+
+# ── Idempotent restore: detect already-running sessions ──
+
+$runningSessionIds = @()
+$claudeNodes = Get-CimInstance Win32_Process -Property ProcessId,Name -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -eq 'node.exe' }
+$claudeSessionsDir = Join-Path $env:USERPROFILE '.claude\sessions'
+if ($claudeNodes -and (Test-Path $claudeSessionsDir)) {
+    foreach ($node in $claudeNodes) {
+        $sf = Join-Path $claudeSessionsDir "$($node.ProcessId).json"
+        if (Test-Path $sf) {
+            try {
+                $raw = Get-Content $sf -Raw
+                if ($raw -match '"sessionId":"([^"]+)"') { $runningSessionIds += $Matches[1] }
+            } catch { }
+        }
+    }
+}
 if (-not $Silent) {
     Write-Host "Restoring session from $($session.savedAt)..." -ForegroundColor Cyan
     Write-Host "  $($session.windows.Count) window(s)" -ForegroundColor DarkGray
@@ -99,27 +130,40 @@ if ($wtProc) {
 # ── Restore each window ──
 
 $winIdx = 0
+$skippedTabs = 0
 foreach ($win in $session.windows) {
     $winIdx++
-    if ($win.tabs.Count -eq 0) { continue }
+
+    # Filter out already-running Claude sessions (idempotent restore)
+    $tabsToRestore = @()
+    foreach ($tab in $win.tabs) {
+        if ($tab.type -eq 'claude' -and $tab.sessionId -and $tab.sessionId -in $runningSessionIds) {
+            $skippedTabs++
+            if (-not $Silent) { Write-Host "  Skipping already-running: $($tab.sessionName)" -ForegroundColor DarkGray }
+            continue
+        }
+        $tabsToRestore += $tab
+    }
+
+    if ($tabsToRestore.Count -eq 0) { continue }
 
     if (-not $Silent) {
-        Write-Host "`nWindow $winIdx ($($win.tabs.Count) tab(s)):" -ForegroundColor White
+        Write-Host "`nWindow $winIdx ($($tabsToRestore.Count) tab(s)):" -ForegroundColor White
     }
 
     # First tab — creates the window
-    $first = Get-TabCommand $win.tabs[0]
+    $first = Get-TabCommand $tabsToRestore[0]
     if ($first.cmd) {
         Start-Process "wt.exe" -ArgumentList "-d `"$($first.cwd)`" powershell.exe -NoExit -Command `"$($first.cmd)`""
     } else {
         Start-Process "wt.exe" -ArgumentList "-d `"$($first.cwd)`""
     }
-    if (-not $Silent) { Write-Host "  Tab 1: [$($win.tabs[0].type)] $($first.cwd)" -ForegroundColor Gray }
+    if (-not $Silent) { Write-Host "  Tab 1: [$($tabsToRestore[0].type)] $($first.cwd)" -ForegroundColor Gray }
     Start-Sleep -Milliseconds $delay
 
     # Remaining tabs — add to the most recent window
-    for ($i = 1; $i -lt $win.tabs.Count; $i++) {
-        $t = Get-TabCommand $win.tabs[$i]
+    for ($i = 1; $i -lt $tabsToRestore.Count; $i++) {
+        $t = Get-TabCommand $tabsToRestore[$i]
         if (-not $t) { continue }
 
         if ($t.cmd) {
@@ -127,7 +171,7 @@ foreach ($win in $session.windows) {
         } else {
             Start-Process "wt.exe" -ArgumentList "-w 0 new-tab -d `"$($t.cwd)`""
         }
-        if (-not $Silent) { Write-Host "  Tab $($i+1): [$($win.tabs[$i].type)] $($t.cwd)" -ForegroundColor Gray }
+        if (-not $Silent) { Write-Host "  Tab $($i+1): [$($tabsToRestore[$i].type)] $($t.cwd)" -ForegroundColor Gray }
         Start-Sleep -Milliseconds 500
     }
 
@@ -169,7 +213,9 @@ foreach ($win in $session.windows) {
 # ── Summary ──
 
 $totalTabs = ($session.windows | ForEach-Object { $_.tabs.Count } | Measure-Object -Sum).Sum
-$msg = "Restored $($session.windows.Count) window(s), $totalTabs tab(s)"
+$restoredTabs = $totalTabs - $skippedTabs
+$msg = "Restored $restoredTabs tab(s)"
+if ($skippedTabs -gt 0) { $msg += " (skipped $skippedTabs already running)" }
 
 if (-not $Silent) {
     Write-Host "`n$msg" -ForegroundColor Green

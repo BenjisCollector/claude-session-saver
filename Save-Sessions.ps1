@@ -59,7 +59,7 @@ $wtPids = $wtProcs | ForEach-Object { $_.Id }
 $shells = $allProcs | Where-Object {
     $_.ParentProcessId -in $wtPids -and
     $_.Name -ne "OpenConsole.exe" -and
-    $_.Name -match "powershell|pwsh|cmd|bash|ssh|conhost"
+    $_.Name -match "powershell|pwsh|cmd|bash|ssh|conhost|wsl|nu"
 }
 
 # Also find shells that are children of OpenConsole (varies by WT version)
@@ -70,8 +70,14 @@ $ocShells = $allProcs | Where-Object {
 }
 if ($ocShells) { $shells = @($shells) + @($ocShells) }
 
+# Collect descendants up to 3 levels deep (handles nested bash > bash > node patterns)
 $shellPids = $shells | ForEach-Object { $_.ProcessId }
-$shellChildren = $allProcs | Where-Object { $_.ParentProcessId -in $shellPids }
+$level1 = $allProcs | Where-Object { $_.ParentProcessId -in $shellPids }
+$level1Pids = $level1 | ForEach-Object { $_.ProcessId }
+$level2 = $allProcs | Where-Object { $_.ParentProcessId -in $level1Pids }
+$level2Pids = $level2 | ForEach-Object { $_.ProcessId }
+$level3 = $allProcs | Where-Object { $_.ParentProcessId -in $level2Pids }
+$shellChildren = @($level1) + @($level2) + @($level3)
 
 # ── Claude session files ──
 
@@ -107,18 +113,31 @@ foreach ($shell in $shells) {
             if (Test-Path $sessionFile) {
                 try {
                     $raw = Get-Content $sessionFile -Raw
-                    # Fix malformed JSON: some session files have }"name":... outside the object
-                    if ($raw -match '^\{.*?\}') {
-                        $jsonPart = $Matches[0]
+                    $s = $null
+                    # Try normal parse first
+                    try { $s = $raw | ConvertFrom-Json } catch { }
+                    if (-not $s) {
+                        # Malformed JSON: find balanced first object, extract trailing fields
                         $trailingName = $null
                         if ($raw -match '\}"name":"([^"]+)"') { $trailingName = $Matches[1] }
-                        $s = $jsonPart | ConvertFrom-Json
+                        $depth = 0; $end = -1
+                        for ($ci = 0; $ci -lt $raw.Length; $ci++) {
+                            if ($raw[$ci] -eq '{') { $depth++ }
+                            elseif ($raw[$ci] -eq '}') { $depth--; if ($depth -eq 0) { $end = $ci; break } }
+                        }
+                        if ($end -gt 0) {
+                            $s = $raw.Substring(0, $end + 1) | ConvertFrom-Json
+                            if ($trailingName -and -not $s.name) { $s | Add-Member -NotePropertyName 'name' -NotePropertyValue $trailingName }
+                        }
+                    }
+                    if ($s) {
                         $tab["sessionId"] = $s.sessionId
                         $tab.cwd = $s.cwd
                         if ($s.name) { $tab["sessionName"] = $s.name }
-                        elseif ($trailingName) { $tab["sessionName"] = $trailingName }
                     }
-                } catch { }
+                } catch {
+                    if (-not $Silent) { Write-Host "  Warning: Could not parse session file: $_" -ForegroundColor Yellow }
+                }
             }
 
             # Read model and permissionMode from conversation JSONL
@@ -152,6 +171,11 @@ foreach ($shell in $shells) {
             }
         }
 
+        # CWD fallback chain: JSONL project path > node.exe PEB > shell PEB
+        if ((-not $tab.cwd -or $tab.cwd -eq $env:USERPROFILE) -and $claudeChildren.Count -gt 0) {
+            $cwd = [WinApi]::GetProcessCwd($claudeChildren[0].ProcessId)
+            if ($cwd -and $cwd -ne $env:USERPROFILE) { $tab.cwd = $cwd }
+        }
         if (-not $tab.cwd) {
             $cwd = [WinApi]::GetProcessCwd($shell.ProcessId)
             if ($cwd) { $tab.cwd = $cwd }

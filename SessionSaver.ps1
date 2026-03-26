@@ -16,6 +16,13 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# ── Single-instance guard ──
+
+$script:mutex = New-Object System.Threading.Mutex($false, 'ClaudeSessionSaverTray')
+if (-not $script:mutex.WaitOne(0)) {
+    exit 0
+}
+
 # ── Load config ──
 
 $configPath = Join-Path $root 'config.json'
@@ -42,11 +49,11 @@ $tray.Visible = $true
 function Invoke-Save {
     try {
         $saveScript = Join-Path $root 'Save-Sessions.ps1'
-        $proc = Start-Process powershell.exe -ArgumentList @(
+        # Fire-and-forget — don't block the UI thread
+        Start-Process powershell.exe -ArgumentList @(
             '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
             '-File', $saveScript, '-Silent'
-        ) -PassThru -WindowStyle Hidden
-        $proc.WaitForExit(30000)
+        ) -WindowStyle Hidden
     } catch {
         $tray.ShowBalloonTip(3000, 'Error', "Save failed: $_", [System.Windows.Forms.ToolTipIcon]::Error)
     }
@@ -179,6 +186,14 @@ $timer.Add_Tick({
     }
 })
 $timer.Start()
+
+# ── Cleanup on unexpected exit ──
+
+[System.Windows.Forms.Application]::add_ApplicationExit({
+    $tray.Visible = $false
+    $tray.Dispose()
+    if ($script:mutex) { $script:mutex.ReleaseMutex(); $script:mutex.Dispose() }
+})
 
 # ── Run message loop ──
 
