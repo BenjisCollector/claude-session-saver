@@ -1,19 +1,19 @@
 <#
 .SYNOPSIS
-    Restores Windows Terminal windows, tabs, and Claude Code sessions from a saved snapshot.
+    Thaws Windows Terminal windows, tabs, and Claude Code sessions from a frozen snapshot.
 .DESCRIPTION
-    Reads a previously saved JSON snapshot and reopens all Windows Terminal windows at their
+    Reads a previously frozen JSON snapshot and reopens all Windows Terminal windows at their
     exact screen positions. Resumes Claude Code conversations, reconnects SSH sessions, and
     opens plain tabs at their saved working directories.
 
-    Uses two-phase restore: all windows/tabs are launched rapidly first, then positioned in batch.
+    Uses two-phase thaw: all windows/tabs are launched rapidly first, then positioned in batch.
 .PARAMETER Path
     Path to a specific save file. Defaults to saves/latest.json.
 .PARAMETER Silent
     Suppress console output (used when invoked from the system tray).
 .EXAMPLE
-    .\Restore-Sessions.ps1
-    .\Restore-Sessions.ps1 -Path "saves\2026-03-26T160000.json"
+    .\Thaw.ps1
+    .\Thaw.ps1 -Path "saves\2026-03-26T160000.json"
 #>
 param(
     [string]$Path,
@@ -93,7 +93,7 @@ function Get-TabCommand($tab) {
 # ── Validate ──
 
 if (-not (Test-Path $latestPath)) {
-    $msg = "No saved session found. Run Save-Sessions.ps1 first."
+    $msg = "No frozen workspace found. Run Freeze.ps1 first."
     if (-not $Silent) { Write-Host $msg -ForegroundColor Red }
     exit 1
 }
@@ -119,7 +119,7 @@ if ($claudeNodes -and (Test-Path $claudeSessionsDir)) {
 }
 
 if (-not $Silent) {
-    Write-Host "Restoring session from $($session.savedAt)..." -ForegroundColor Cyan
+    Write-Host "Thawing workspace from $($session.savedAt)..." -ForegroundColor Cyan
     Write-Host "  $($session.windows.Count) window(s)" -ForegroundColor DarkGray
 }
 
@@ -273,7 +273,7 @@ if ($windowMeta.Count -gt 0) {
 
 $totalTabs = ($session.windows | ForEach-Object { $_.tabs.Count } | Measure-Object -Sum).Sum
 $restoredTabs = $totalTabs - $skippedTabs
-$msg = "Restored $restoredTabs tab(s) across $($windowMeta.Count) window(s)"
+$msg = "Thawed $restoredTabs tab(s) across $($windowMeta.Count) window(s)"
 if ($skippedTabs -gt 0) { $msg += " (skipped $skippedTabs already running)" }
 
 if (-not $Silent) {
@@ -286,10 +286,10 @@ if ($config.enableToastNotifications) {
         $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
             [Windows.UI.Notifications.ToastTemplateType]::ToastText02)
         $text = $xml.GetElementsByTagName("text")
-        $text.Item(0).AppendChild($xml.CreateTextNode("Claude Session Saver")) | Out-Null
+        $text.Item(0).AppendChild($xml.CreateTextNode("Cryosave")) | Out-Null
         $text.Item(1).AppendChild($xml.CreateTextNode($msg)) | Out-Null
         $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(
-            "Claude Session Saver").Show($toast)
+            "Cryosave").Show($toast)
     } catch { }
 }

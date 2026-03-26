@@ -15,7 +15,7 @@ if ($files.Count -eq 0) {
     exit 0
 }
 
-Write-Host "Saved Sessions:" -ForegroundColor Cyan
+Write-Host "Frozen Workspaces:" -ForegroundColor Cyan
 Write-Host ""
 
 foreach ($f in $files) {

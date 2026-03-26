@@ -1,13 +1,13 @@
 <#
 .SYNOPSIS
-    System tray application for Claude Session Saver.
+    System tray application for Cryosave.
 .DESCRIPTION
     Runs silently in the notification area (system tray).
     Features:
-    - Right-click menu: Save, Restore, List Saves, Open Folder, Settings
-    - Double-click: quick save
-    - Auto-save every N minutes (configurable, default 5)
-    - Global hotkey: Ctrl+Shift+S to save (optional)
+    - Right-click menu: Freeze, Thaw, List Saves, Open Folder, Settings
+    - Double-click: quick freeze
+    - Auto-freeze every N minutes (configurable, default 5)
+    - Global hotkey: Ctrl+Shift+S to freeze (optional)
 #>
 
 $ErrorActionPreference = 'Continue'
@@ -18,7 +18,7 @@ Add-Type -AssemblyName System.Drawing
 
 # ── Single-instance guard ──
 
-$script:mutex = New-Object System.Threading.Mutex($false, 'ClaudeSessionSaverTray')
+$script:mutex = New-Object System.Threading.Mutex($false, 'CryosaveTray')
 if (-not $script:mutex.WaitOne(0)) {
     exit 0
 }
@@ -41,21 +41,21 @@ if (Test-Path $customIconPath) {
 
 $tray = New-Object System.Windows.Forms.NotifyIcon
 $tray.Icon = $icon
-$tray.Text = 'Claude Session Saver'
+$tray.Text = 'Cryosave'
 $tray.Visible = $true
 
 # ── Save helper ──
 
 function Invoke-Save {
     try {
-        $saveScript = Join-Path $root 'Save-Sessions.ps1'
+        $saveScript = Join-Path $root 'Freeze.ps1'
         # Fire-and-forget — don't block the UI thread
         Start-Process powershell.exe -ArgumentList @(
             '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
             '-File', $saveScript, '-Silent'
         ) -WindowStyle Hidden
     } catch {
-        $tray.ShowBalloonTip(3000, 'Error', "Save failed: $_", [System.Windows.Forms.ToolTipIcon]::Error)
+        $tray.ShowBalloonTip(3000, 'Error', "Freeze failed: $_", [System.Windows.Forms.ToolTipIcon]::Error)
     }
 }
 
@@ -64,21 +64,21 @@ function Invoke-Save {
 $menu = New-Object System.Windows.Forms.ContextMenuStrip
 
 # Save
-$saveItem = New-Object System.Windows.Forms.ToolStripMenuItem('Save Sessions')
+$saveItem = New-Object System.Windows.Forms.ToolStripMenuItem('Freeze Workspace')
 $saveItem.Font = New-Object System.Drawing.Font($saveItem.Font, [System.Drawing.FontStyle]::Bold)
 $saveItem.ShortcutKeyDisplayString = 'Dbl-click'
 $saveItem.Add_Click({ Invoke-Save })
 $menu.Items.Add($saveItem) | Out-Null
 
 # Restore
-$restoreItem = New-Object System.Windows.Forms.ToolStripMenuItem('Restore Sessions')
+$restoreItem = New-Object System.Windows.Forms.ToolStripMenuItem('Thaw Workspace')
 $restoreItem.Add_Click({
     $latestPath = Join-Path $root 'saves\latest.json'
     if (-not (Test-Path $latestPath)) {
-        $tray.ShowBalloonTip(3000, 'No Saves', 'No saved sessions found. Save first.', [System.Windows.Forms.ToolTipIcon]::Warning)
+        $tray.ShowBalloonTip(3000, 'No Saves', 'No frozen workspace found. Freeze first.', [System.Windows.Forms.ToolTipIcon]::Warning)
         return
     }
-    $restoreScript = Join-Path $root 'Restore-Sessions.ps1'
+    $restoreScript = Join-Path $root 'Thaw.ps1'
     Start-Process powershell.exe -ArgumentList @(
         '-ExecutionPolicy', 'Bypass', '-File', $restoreScript
     )
@@ -89,7 +89,7 @@ $menu.Items.Add($restoreItem) | Out-Null
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
 # Last save info
-$infoItem = New-Object System.Windows.Forms.ToolStripMenuItem('Last save: (none)')
+$infoItem = New-Object System.Windows.Forms.ToolStripMenuItem('Last freeze: (none)')
 $infoItem.Enabled = $false
 $menu.Items.Add($infoItem) | Out-Null
 
@@ -100,12 +100,12 @@ $menu.Add_Opening({
         try {
             $data = Get-Content $latestPath -Raw | ConvertFrom-Json
             $tabs = ($data.windows | ForEach-Object { $_.tabs.Count } | Measure-Object -Sum).Sum
-            $infoItem.Text = "Last save: $($data.savedAt) ($($data.windows.Count) win, $tabs tabs)"
+            $infoItem.Text = "Last freeze: $($data.savedAt) ($($data.windows.Count) win, $tabs tabs)"
         } catch {
-            $infoItem.Text = 'Last save: (error reading)'
+            $infoItem.Text = 'Last freeze: (error reading)'
         }
     } else {
-        $infoItem.Text = 'Last save: (none)'
+        $infoItem.Text = 'Last freeze: (none)'
     }
 })
 
@@ -130,7 +130,7 @@ $listItem.Add_Click({
         $tabs = ($data.windows | ForEach-Object { $_.tabs.Count } | Measure-Object -Sum).Sum
         "$($_.BaseName) - $($data.windows.Count) win, $tabs tabs"
     }) -join "`n"
-    $tray.ShowBalloonTip(10000, "Saved Sessions ($($files.Count))", $list, [System.Windows.Forms.ToolTipIcon]::Info)
+    $tray.ShowBalloonTip(10000, "Frozen Workspaces ($($files.Count))", $list, [System.Windows.Forms.ToolTipIcon]::Info)
 })
 $menu.Items.Add($listItem) | Out-Null
 
@@ -148,7 +148,7 @@ $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 
 # Auto-save toggle
 $autoSaveMinutes = if ($config.autoSaveMinutes) { $config.autoSaveMinutes } else { 5 }
-$autoSaveItem = New-Object System.Windows.Forms.ToolStripMenuItem("Auto-save every ${autoSaveMinutes}min")
+$autoSaveItem = New-Object System.Windows.Forms.ToolStripMenuItem("Auto-freeze every ${autoSaveMinutes}min")
 $autoSaveItem.Checked = $true
 $autoSaveItem.CheckOnClick = $true
 $menu.Items.Add($autoSaveItem) | Out-Null

@@ -1,15 +1,15 @@
 <#
 .SYNOPSIS
-    Saves all Windows Terminal windows, tabs, and Claude Code sessions to a JSON snapshot.
+    Freezes all Windows Terminal windows, tabs, and Claude Code sessions to a JSON snapshot.
 .DESCRIPTION
     Scans running Windows Terminal instances, detects Claude Code sessions (local and SSH),
-    plain PowerShell tabs, and other processes. Saves window positions, sizes, working
-    directories, and Claude session IDs for later restoration.
+    plain PowerShell tabs, and other processes. Freezes window positions, sizes, working
+    directories, and Claude session IDs for later thawing.
 .PARAMETER Silent
     Suppress console output (used when invoked from the system tray).
 .EXAMPLE
-    .\Save-Sessions.ps1
-    .\Save-Sessions.ps1 -Silent
+    .\Freeze.ps1
+    .\Freeze.ps1 -Silent
 #>
 param([switch]$Silent)
 
@@ -301,7 +301,7 @@ if ($saves.Count -gt $max) {
 $totalTabs = ($output.windows | ForEach-Object { $_.tabs.Count } | Measure-Object -Sum).Sum
 $claudeTabs = ($output.windows | ForEach-Object { $_.tabs | Where-Object { $_.type -eq "claude" } } | Measure-Object).Count
 $sshTabs = ($output.windows | ForEach-Object { $_.tabs | Where-Object { $_.type -eq "ssh" } } | Measure-Object).Count
-$msg = "Saved $($output.windows.Count) window(s), $totalTabs tab(s) ($claudeTabs Claude, $sshTabs SSH)"
+$msg = "Frozen $($output.windows.Count) window(s), $totalTabs tab(s) ($claudeTabs Claude, $sshTabs SSH)"
 
 if (-not $Silent) {
     Write-Host $msg -ForegroundColor Green
@@ -316,10 +316,10 @@ if ($config.enableToastNotifications) {
         $xml = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent(
             [Windows.UI.Notifications.ToastTemplateType]::ToastText02)
         $text = $xml.GetElementsByTagName("text")
-        $text.Item(0).AppendChild($xml.CreateTextNode("Claude Session Saver")) | Out-Null
+        $text.Item(0).AppendChild($xml.CreateTextNode("Cryosave")) | Out-Null
         $text.Item(1).AppendChild($xml.CreateTextNode($msg)) | Out-Null
         $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(
-            "Claude Session Saver").Show($toast)
+            "Cryosave").Show($toast)
     } catch { }
 }

@@ -1,22 +1,22 @@
 <#
 .SYNOPSIS
-    Removes Claude Session Saver shortcuts and startup entry.
+    Removes Cryosave shortcuts and startup entry.
 #>
 
 $startMenu = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs"
 $startupDir = "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup"
 
 Write-Host ""
-Write-Host "  Claude Session Saver — Uninstall" -ForegroundColor Cyan
+Write-Host "  Cryosave — Uninstall" -ForegroundColor Cyan
 Write-Host ""
 
 # Kill tray app if running
 Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
-    $_.CommandLine -match "SessionSaver\.ps1"
+    $_.CommandLine -match "Cryosave\.ps1"
 } | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
 
 # Remove Scheduled Task (v1.0.1+)
-$taskName = 'ClaudeSessionSaverTray'
+$taskName = 'CryosaveTray'
 $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
 if ($existing) {
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
@@ -24,9 +24,9 @@ if ($existing) {
 }
 
 $files = @(
-    "$startMenu\Save Claude Sessions.lnk",
-    "$startMenu\Restore Claude Sessions.lnk",
-    "$startupDir\Claude Session Saver.lnk"
+    "$startMenu\Cryosave - Freeze.lnk",
+    "$startMenu\Cryosave - Thaw.lnk",
+    "$startupDir\Cryosave.lnk"
 )
 
 foreach ($f in $files) {
