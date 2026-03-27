@@ -137,6 +137,65 @@ if (-not (Test-Path $latestPath)) {
 
 $session = Get-Content $latestPath -Raw | ConvertFrom-Json
 
+# ── Pre-trust all Claude tab CWDs so the workspace trust dialog never appears ──
+
+$claudeJsonPath = Join-Path $env:USERPROFILE ".claude.json"
+$claudeCwds = @()
+foreach ($win in $session.windows) {
+    foreach ($tab in $win.tabs) {
+        if ($tab.type -eq "claude" -and $tab.cwd -and (Test-Path $tab.cwd)) {
+            $fwd = $tab.cwd -replace '\\', '/'
+            if ($fwd -notin $claudeCwds) { $claudeCwds += $fwd }
+        }
+    }
+}
+
+if ($claudeCwds.Count -gt 0 -and (Test-Path $claudeJsonPath)) {
+    try {
+        $claudeJson = Get-Content $claudeJsonPath -Raw | ConvertFrom-Json
+        if (-not $claudeJson.projects) {
+            $claudeJson | Add-Member -NotePropertyName "projects" -NotePropertyValue ([pscustomobject]@{}) -Force
+        }
+        $modified = $false
+        foreach ($cwd in $claudeCwds) {
+            $existing = $claudeJson.projects.PSObject.Properties[$cwd]
+            if ($existing) {
+                if (-not $existing.Value.hasTrustDialogAccepted) {
+                    $existing.Value.hasTrustDialogAccepted = $true
+                    $modified = $true
+                }
+                if (-not $existing.Value.hasCompletedProjectOnboarding) {
+                    $existing.Value.hasCompletedProjectOnboarding = $true
+                    $modified = $true
+                }
+            } else {
+                $entry = [pscustomobject]@{
+                    allowedTools = @()
+                    mcpContextUris = @()
+                    mcpServers = [pscustomobject]@{}
+                    enabledMcpjsonServers = @()
+                    disabledMcpjsonServers = @()
+                    hasTrustDialogAccepted = $true
+                    projectOnboardingSeenCount = 0
+                    hasClaudeMdExternalIncludesApproved = $false
+                    hasClaudeMdExternalIncludesWarningShown = $false
+                    hasCompletedProjectOnboarding = $true
+                }
+                $claudeJson.projects | Add-Member -NotePropertyName $cwd -NotePropertyValue $entry -Force
+                $modified = $true
+            }
+        }
+        if ($modified) {
+            $claudeJson | ConvertTo-Json -Depth 10 | Set-Content $claudeJsonPath -Encoding UTF8
+            if (-not $Silent) {
+                Write-Host "Pre-trusted $($claudeCwds.Count) workspace(s) for Claude Code" -ForegroundColor DarkGray
+            }
+        }
+    } catch {
+        if (-not $Silent) { Write-Host "  Warning: could not pre-trust workspaces: $_" -ForegroundColor Yellow }
+    }
+}
+
 # ── Idempotent restore: detect already-running sessions ──
 
 $runningSessionIds = @()
