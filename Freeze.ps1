@@ -5,13 +5,20 @@
     Scans running Windows Terminal instances, detects Claude Code sessions (local and SSH),
     plain PowerShell tabs, and other processes. Freezes window positions, sizes, working
     directories, and Claude session IDs for later thawing.
+.PARAMETER Close
+    Close all Windows Terminal windows that contain Claude Code sessions after freezing.
+    Non-Claude windows are left untouched.
 .PARAMETER Silent
     Suppress console output (used when invoked from the system tray).
 .EXAMPLE
     .\Freeze.ps1
+    .\Freeze.ps1 -Close
     .\Freeze.ps1 -Silent
 #>
-param([switch]$Silent)
+param(
+    [switch]$Silent,
+    [switch]$Close
+)
 
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
@@ -103,6 +110,14 @@ foreach ($shell in $shells) {
     }
     elseif ($name -match "powershell|pwsh|cmd|bash") {
         $children = $shellChildren | Where-Object { $_.ParentProcessId -eq $shell.ProcessId }
+
+        # Check for SSH child processes (e.g., cmd.exe /k ssh ...)
+        $sshChildren = @($children | Where-Object { $_.Name -match "^ssh(\.exe)?$" })
+        if ($sshChildren.Count -gt 0) {
+            $tab.type = "ssh"
+            $tab["commandLine"] = $sshChildren[0].CommandLine
+        } else {
+
         $claudeChildren = @($children | Where-Object { $_.Name -eq "node.exe" -and $_.CommandLine -match "claude" })
 
         if ($claudeChildren.Count -gt 0) {
@@ -170,6 +185,7 @@ foreach ($shell in $shells) {
                 }
             }
         }
+        } # end SSH else
 
         # CWD fallback chain: JSONL project path > node.exe PEB > shell PEB
         if ((-not $tab.cwd -or $tab.cwd -eq $env:USERPROFILE) -and $claudeChildren.Count -gt 0) {
@@ -191,47 +207,146 @@ foreach ($shell in $shells) {
     $tabs += $tab
 }
 
-# ── Group tabs into windows ──
-# WT spawns shells and OpenConsoles as direct siblings under one PID, so we can't
-# trace which tab belongs to which window via process tree alone.
-#
-# Strategy: match tabs to windows by comparing session names / SSH commands to window
-# titles. Each WT window title typically contains the Claude session name or "ssh".
-# Unmatched tabs are distributed round-robin to windows with no matches.
+# ── Group tabs into windows using UI Automation ──
+# The old approach matched only against window titles, which show only the ACTIVE tab.
+# UIA lets us enumerate ALL tab names per window — far more reliable.
+
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+
+function Get-WtUiaTabs([IntPtr]$hwnd) {
+    try {
+        $el = [System.Windows.Automation.AutomationElement]::FromHandle($hwnd)
+        $cond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::TabItem
+        )
+        $items = $el.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+        $names = @()
+        foreach ($item in $items) { $names += $item.Current.Name }
+        return $names
+    } catch { return @() }
+}
+
+function Get-TabMatchScore($tab, [string]$uiaName) {
+    # Use .Contains() everywhere — -like and -match have wildcard/regex pitfalls
+    # that cause phantom matches with special chars in SSH commands, paths, etc.
+    $u = $uiaName.ToLower()
+    $homeName = (Split-Path $env:USERPROFILE -Leaf).ToLower()
+
+    # Session name match (strongest — Claude Code sets the tab title to session name)
+    if ($tab.sessionName) {
+        $sn = $tab.sessionName.ToLower()
+        if ($u.Contains($sn) -or $sn.Contains($u)) { return 100 }
+    }
+
+    # SSH command match — full command or hostname in UIA tab name
+    if ($tab.type -eq "ssh" -and $tab.commandLine) {
+        $cmdLower = $tab.commandLine.ToLower()
+        if ($u.Contains($cmdLower) -or $cmdLower.Contains($u)) { return 90 }
+        if ($cmdLower -match '@([\w.-]+)') {
+            $sshHost = $Matches[1].ToLower()
+            if ($u.Contains($sshHost)) { return 70 }
+        }
+        if ($u.Contains("ssh")) { return 30 }
+    }
+
+    # CWD folder name match (WT often shows folder in tab title)
+    # Exclude home folder name — too generic, matches everything
+    if ($tab.cwd) {
+        $folder = (Split-Path $tab.cwd -Leaf).ToLower()
+        if ($folder.Length -gt 1 -and $folder -ne $homeName -and $u.Contains($folder)) { return 50 }
+    }
+
+    # Generic type match (weak fallback)
+    if ($tab.type -eq "claude" -and $u.Contains("claude")) { return 10 }
+    if ($tab.type -eq "powershell" -and ($u.Contains("powershell") -or $u.Contains("pwsh"))) { return 5 }
+
+    return 0
+}
 
 # Filter out off-screen / hidden helper windows (position < -10000)
 $visibleWindows = $windows | Where-Object { $_.Position.left -gt -10000 -and $_.Position.top -gt -10000 }
 
+# Enumerate UIA tab names per window
+$windowUiaTabs = @{}
+$uiaAvailable = $false
+for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) {
+    $windowUiaTabs[$wi] = @(Get-WtUiaTabs $visibleWindows[$wi].Hwnd)
+    if ($windowUiaTabs[$wi].Count -gt 0) { $uiaAvailable = $true }
+    if (-not $Silent) {
+        Write-Host "  Window $($wi+1) UIA tabs ($($windowUiaTabs[$wi].Count)): $($windowUiaTabs[$wi] -join ' | ')" -ForegroundColor DarkGray
+    }
+}
+
 $matched = @{}  # windowIndex -> [tabs]
-$unmatched = @()
+$claimed = @{}  # tabIndex -> $true (prevents double-assignment)
 
-foreach ($tab in $tabs) {
-    $found = $false
+if ($uiaAvailable) {
+    # Global score-sorted matching: collect ALL (window, uia_tab, detected_tab, score)
+    # tuples, then assign greedily from highest score first. This prevents a weak match
+    # (e.g., generic "claude" score=10) from stealing a tab that has a strong match
+    # (e.g., folder name "shotiq" score=50) to a different window.
+    for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) { $matched[$wi] = @() }
 
-    # Try to match by session name or command line against window title
-    $matchStr = $null
-    if ($tab.sessionName) { $matchStr = $tab.sessionName }
-    elseif ($tab.type -eq "ssh") { $matchStr = "ssh" }
-
-    if ($matchStr) {
-        for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) {
-            $title = $visibleWindows[$wi].Title
-            if ($title -match [regex]::Escape($matchStr)) {
-                if (-not $matched[$wi]) { $matched[$wi] = @() }
-                $matched[$wi] += $tab
-                $found = $true
-                break
+    $candidates = @()
+    for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) {
+        for ($ui = 0; $ui -lt $windowUiaTabs[$wi].Count; $ui++) {
+            $uiaName = $windowUiaTabs[$wi][$ui]
+            for ($ti = 0; $ti -lt $tabs.Count; $ti++) {
+                $score = Get-TabMatchScore $tabs[$ti] $uiaName
+                if ($score -gt 0) {
+                    $candidates += [pscustomobject]@{ wi=$wi; ui=$ui; ti=$ti; score=$score; uia=$uiaName }
+                }
             }
         }
     }
 
-    if (-not $found) { $unmatched += $tab }
+    # Sort highest score first — strongest matches get priority
+    $candidates = $candidates | Sort-Object -Property score -Descending
+    $uiaClaimed = @{}  # "wi:ui" -> true (each UIA slot takes one tab)
+
+    foreach ($c in $candidates) {
+        $uiaKey = "$($c.wi):$($c.ui)"
+        if ($claimed[$c.ti] -or $uiaClaimed[$uiaKey]) { continue }
+        $matched[$c.wi] += $tabs[$c.ti]
+        $claimed[$c.ti] = $true
+        $uiaClaimed[$uiaKey] = $true
+        if (-not $Silent) {
+            Write-Host "    Matched tab $($c.ti) ($($tabs[$c.ti].type)) -> Window $($c.wi+1) UIA '$($c.uia)' (score=$($c.score))" -ForegroundColor DarkCyan
+        }
+    }
+} else {
+    # Fallback: match by window title (old approach — only sees active tab)
+    if (-not $Silent) { Write-Host "  UIA unavailable, falling back to title matching" -ForegroundColor Yellow }
+    for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) { $matched[$wi] = @() }
+    for ($ti = 0; $ti -lt $tabs.Count; $ti++) {
+        $tab = $tabs[$ti]
+        $matchStr = $null
+        if ($tab.sessionName) { $matchStr = $tab.sessionName }
+        elseif ($tab.type -eq "ssh") { $matchStr = "ssh" }
+
+        if ($matchStr) {
+            for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) {
+                if ($visibleWindows[$wi].Title -match [regex]::Escape($matchStr)) {
+                    $matched[$wi] += $tab
+                    $claimed[$ti] = $true
+                    break
+                }
+            }
+        }
+    }
 }
 
-# Distribute unmatched tabs to windows that got no tabs yet, then round-robin
+# Distribute unclaimed tabs to windows that still need tabs, then round-robin
+$unmatched = @()
+for ($ti = 0; $ti -lt $tabs.Count; $ti++) {
+    if (-not $claimed[$ti]) { $unmatched += $tabs[$ti] }
+}
+
 $emptyWindows = @()
 for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) {
-    if (-not $matched[$wi]) { $emptyWindows += $wi }
+    if ($matched[$wi].Count -eq 0) { $emptyWindows += $wi }
 }
 
 $umi = 0
@@ -241,7 +356,6 @@ foreach ($tab in $unmatched) {
     } else {
         $wi = $umi % $visibleWindows.Count; $umi++
     }
-    if (-not $matched[$wi]) { $matched[$wi] = @() }
     $matched[$wi] += $tab
 }
 
@@ -322,4 +436,40 @@ if ($config.enableToastNotifications) {
         [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier(
             "Cryosave").Show($toast)
     } catch { }
+}
+
+# ── Close Claude windows if requested ──
+
+if ($Close -and $claudeTabs -gt 0) {
+    # Find which WT PIDs had Claude tabs
+    $claudeWtPids = @()
+    foreach ($win in $windows) {
+        $hasClaude = $win.Tabs | Where-Object { $_.type -eq "claude" }
+        if ($hasClaude) { $claudeWtPids += $win.WtPid }
+    }
+    $claudeWtPids = $claudeWtPids | Select-Object -Unique
+
+    # Force-kill WT processes that had Claude sessions
+    # WM_CLOSE doesn't work (WT shows confirmation dialog)
+    # Stop-Process can fail silently on UWP/MSIX WT on Windows 11
+    $closed = 0
+    foreach ($pid in $claudeWtPids) {
+        # Try taskkill first (more reliable for UWP apps), then Stop-Process as fallback
+        $result = & taskkill /F /PID $pid /T 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+        }
+        $closed++
+    }
+
+    # Fallback: if WT is still running, kill by name
+    Start-Sleep -Milliseconds 300
+    $stillRunning = Get-Process -Name 'WindowsTerminal' -ErrorAction SilentlyContinue
+    if ($stillRunning) {
+        & taskkill /F /IM WindowsTerminal.exe /T 2>&1 | Out-Null
+    }
+
+    if (-not $Silent) {
+        Write-Host "Closed $closed Windows Terminal process(es) containing Claude sessions." -ForegroundColor Yellow
+    }
 }
