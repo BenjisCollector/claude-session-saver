@@ -15,6 +15,7 @@ public struct WindowInfo {
     public int Width;
     public int Height;
     public string Title;
+    public uint Pid;
 }
 
 public static class WinApi {
@@ -68,18 +69,61 @@ public static class WinApi {
             int len = GetWindowTextLength(_found[i]);
             var sb = new StringBuilder(len + 1);
             GetWindowText(_found[i], sb, sb.Capacity);
+            uint wp2; GetWindowThreadProcessId(_found[i], out wp2);
             result[i] = new WindowInfo {
                 Handle = _found[i], Left = r.Left, Top = r.Top,
                 Width = r.Right - r.Left, Height = r.Bottom - r.Top,
-                Title = sb.ToString()
+                Title = sb.ToString(), Pid = wp2
             };
         }
         return result;
     }
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern int GetClassName(IntPtr hWnd, StringBuilder sb, int maxCount);
+
+    /// <summary>Returns handles of all visible windows matching a given class name.</summary>
+    public static IntPtr[] FindWindowsByClass(string className) {
+        var matches = new List<IntPtr>();
+        EnumWindows((h, _) => {
+            if (IsWindowVisible(h)) {
+                var sb = new StringBuilder(256);
+                GetClassName(h, sb, 256);
+                if (sb.ToString() == className)
+                    matches.Add(h);
+            }
+            return true;
+        }, IntPtr.Zero);
+        return matches.ToArray();
+    }
+
+    /// <summary>Returns position, size, title, and owning PID for a single window handle.</summary>
+    public static WindowInfo GetWindowInfoFromHandle(IntPtr hWnd) {
+        RECT r; GetWindowRect(hWnd, out r);
+        int len = GetWindowTextLength(hWnd);
+        var sb = new StringBuilder(len + 1);
+        GetWindowText(hWnd, sb, sb.Capacity);
+        uint pid; GetWindowThreadProcessId(hWnd, out pid);
+        return new WindowInfo {
+            Handle = hWnd, Left = r.Left, Top = r.Top,
+            Width = r.Right - r.Left, Height = r.Bottom - r.Top,
+            Title = sb.ToString(), Pid = pid
+        };
+    }
+
     /// <summary>Moves and resizes a window.</summary>
     public static void MoveWindow(IntPtr hWnd, int x, int y, int w, int h) {
         SetWindowPos(hWnd, IntPtr.Zero, x, y, w, h, 0x0004 | 0x0010);
+    }
+
+    [DllImport("user32.dll")]
+    private static extern bool PostMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    private const uint WM_CLOSE = 0x0010;
+
+    /// <summary>Sends WM_CLOSE to gracefully close a window.</summary>
+    public static void CloseWindow(IntPtr hWnd) {
+        PostMessage(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero);
     }
 
     // ── Process CWD reading via PEB ──

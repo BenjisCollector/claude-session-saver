@@ -109,13 +109,20 @@ Write-Host ''
 Write-Host '  How to use:' -ForegroundColor White
 Write-Host '    1. The tray app starts automatically on login' -ForegroundColor Gray
 Write-Host '       (look for it in the bottom-right hidden icons area)' -ForegroundColor Gray
-Write-Host '    2. Right-click the tray icon, then Freeze Workspace' -ForegroundColor Gray
-Write-Host '    3. Right-click the tray icon, then Thaw Workspace' -ForegroundColor Gray
-Write-Host '    4. Double-click the tray icon for a quick freeze' -ForegroundColor Gray
+Write-Host '    2. Click the tray icon, then Freeze Workspace' -ForegroundColor Gray
+Write-Host '    3. Click the tray icon, then Thaw Workspace' -ForegroundColor Gray
+Write-Host '    4. Click Freeze + Close Sessions to freeze and close Claude windows' -ForegroundColor Gray
 Write-Host ''
 Write-Host '  To pin to taskbar:' -ForegroundColor White
 Write-Host '    Open Start, search Cryosave, right-click, Pin to taskbar' -ForegroundColor Gray
 Write-Host ''
+
+# Kill existing tray app if running (makes re-install idempotent)
+
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'Cryosave\.ps1|SessionSaver\.ps1' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+Start-Sleep -Milliseconds 500
 
 # Launch tray app now
 

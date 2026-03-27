@@ -11,9 +11,9 @@ Write-Host "  Cryosave — Uninstall" -ForegroundColor Cyan
 Write-Host ""
 
 # Kill tray app if running
-Get-Process powershell -ErrorAction SilentlyContinue | Where-Object {
-    $_.CommandLine -match "Cryosave\.ps1"
-} | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -match 'Cryosave\.ps1|SessionSaver\.ps1' } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
 
 # Remove Scheduled Task (v1.0.1+)
 $taskName = 'CryosaveTray'
