@@ -18,19 +18,139 @@
 #>
 param(
     [string]$Path,
+    [string]$Workspace,
     [switch]$Silent
 )
 
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-. "$root\lib\WinApi.ps1"
 
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
+# Hide own console window immediately so no PowerShell window flashes before splash
+try {
+    Add-Type -IgnoreWarnings -Name Win32Hide -Namespace Cryosave -MemberDefinition @'
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+'@ -ErrorAction SilentlyContinue
+    $consoleHwnd = [Cryosave.Win32Hide]::GetConsoleWindow()
+    if ($consoleHwnd -ne [IntPtr]::Zero) { [Cryosave.Win32Hide]::ShowWindow($consoleHwnd, 0) | Out-Null }
+} catch { }
+
+try { . "$root\lib\WinApi.ps1" } catch {
+    if (-not $Silent) { Write-Host "WinApi load failed: $_" -ForegroundColor Red }
+}
+
+# Load WinForms for monitor detection (Screen.AllScreens) — splash runspace loads its own copy
+Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+
+# DPI awareness — must be called before any Screen or coordinate work
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'DpiHelper').Type) {
+        Add-Type -IgnoreWarnings -TypeDefinition 'using System.Runtime.InteropServices; public class DpiHelper { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }' -ErrorAction SilentlyContinue
+    }
+    [DpiHelper]::SetProcessDPIAware() | Out-Null
+} catch { }
+
+# ── Monitor layout + remap functions ──
+
+function Get-MonitorLayout {
+    $screens = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { $_.Bounds.X }, { $_.Bounds.Y }
+    $monitors = @()
+    $idx = 0
+    foreach ($scr in $screens) {
+        $b = $scr.Bounds
+        $monitors += @{
+            index      = $idx
+            deviceName = $scr.DeviceName
+            left       = $b.X
+            top        = $b.Y
+            width      = $b.Width
+            height     = $b.Height
+            primary    = [bool]$scr.Primary
+        }
+        $idx++
+    }
+    $fp = ($monitors | ForEach-Object { "$($_.width)x$($_.height)@$($_.left),$($_.top)" }) -join '|'
+    return @{ monitors = $monitors; fingerprint = $fp }
+}
+
+function Get-RemappedPosition($savedWindow, $savedMonitors, $currentMonitors) {
+    $savedMonIdx = $savedWindow.monitorIndex
+    $savedMon = $savedMonitors | Where-Object { $_.index -eq $savedMonIdx }
+
+    # Find best target monitor: same index if resolution matches, else closest resolution, else primary
+    $targetMon = $null
+    $sameMon = $currentMonitors | Where-Object { $_.index -eq $savedMonIdx }
+    if ($sameMon -and $savedMon -and $sameMon.width -eq $savedMon.width -and $sameMon.height -eq $savedMon.height) {
+        $targetMon = $sameMon
+    }
+    if (-not $targetMon -and $savedMon) {
+        # Closest resolution match
+        $bestDist = [int]::MaxValue
+        foreach ($cm in $currentMonitors) {
+            $dist = [Math]::Abs($cm.width - $savedMon.width) + [Math]::Abs($cm.height - $savedMon.height)
+            if ($dist -lt $bestDist) { $bestDist = $dist; $targetMon = $cm }
+        }
+    }
+    if (-not $targetMon) {
+        $targetMon = $currentMonitors | Where-Object { $_.primary -eq $true }
+        if (-not $targetMon) { $targetMon = $currentMonitors[0] }
+    }
+
+    $rel = $savedWindow.relativePosition
+    $newLeft   = [int]($targetMon.left + $rel.leftPct * $targetMon.width)
+    $newTop    = [int]($targetMon.top  + $rel.topPct  * $targetMon.height)
+    $newWidth  = [int]($rel.widthPct  * $targetMon.width)
+    $newHeight = [int]($rel.heightPct * $targetMon.height)
+
+    # Enforce minimum size
+    $newWidth  = [Math]::Max(400, $newWidth)
+    $newHeight = [Math]::Max(300, $newHeight)
+
+    return @{ left = $newLeft; top = $newTop; width = $newWidth; height = $newHeight }
+}
+
+function Clamp-ToScreen($pos) {
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    # Ensure at least 100px visible within the virtual screen
+    $pos.left   = [Math]::Max($vs.X - $pos.width + 100, [Math]::Min($pos.left, $vs.X + $vs.Width - 100))
+    $pos.top    = [Math]::Max($vs.Y - $pos.height + 100, [Math]::Min($pos.top, $vs.Y + $vs.Height - 100))
+    $pos.width  = [Math]::Max(400, $pos.width)
+    $pos.height = [Math]::Max(300, $pos.height)
+    return $pos
+}
 
 $config = Get-Content "$root\config.json" -Raw | ConvertFrom-Json
 $savesDir = Join-Path $root "saves"
-$latestPath = if ($Path) { $Path } else { Join-Path $savesDir "latest.json" }
+
+# Resolve save file: -Path > -Workspace > auto-detect > latest.json
+if ($Path) {
+    $latestPath = $Path
+} elseif ($Workspace) {
+    $latestPath = Join-Path $savesDir "workspaces\$Workspace.json"
+} else {
+    # Auto-detect: scan workspaces for matching monitor fingerprint
+    $autoDetect = if ($config.autoDetectWorkspace -ne $false) { $true } else { $false }
+    $latestPath = Join-Path $savesDir "latest.json"
+    if ($autoDetect) {
+        $wsDir = Join-Path $savesDir "workspaces"
+        if (Test-Path $wsDir) {
+            $currentLayout = Get-MonitorLayout
+            $wsFiles = Get-ChildItem -Path $wsDir -Filter "*.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+            foreach ($wsf in $wsFiles) {
+                try {
+                    $wsData = Get-Content $wsf.FullName -Raw | ConvertFrom-Json
+                    if ($wsData.monitorFingerprint -eq $currentLayout.fingerprint) {
+                        $latestPath = $wsf.FullName
+                        if (-not $Silent) {
+                            Write-Host "Auto-detected workspace '$($wsf.BaseName)' (monitors match)" -ForegroundColor Cyan
+                        }
+                        break
+                    }
+                } catch { }
+            }
+        }
+    }
+}
 
 # ── Helpers ──
 
@@ -120,7 +240,10 @@ function Get-WtLaunchArgs($windowId, $tabInfo, $isNewTab) {
             $escapedCmd = $tabInfo.cmd -replace '"', '\"'
             return "$prefix $dirArg cmd.exe /k `"$escapedCmd`""
         } else {
-            return "$prefix $dirArg powershell.exe -NoExit -Command `"$($tabInfo.cmd)`""
+            # Use -EncodedCommand to avoid all quoting/escaping issues through WT's arg parser
+            $bytes = [System.Text.Encoding]::Unicode.GetBytes($tabInfo.cmd)
+            $encoded = [Convert]::ToBase64String($bytes)
+            return "$prefix $dirArg powershell.exe -NoExit -EncodedCommand $encoded"
         }
     } else {
         return "$prefix $dirArg"
@@ -152,41 +275,43 @@ foreach ($win in $session.windows) {
 
 if ($claudeCwds.Count -gt 0 -and (Test-Path $claudeJsonPath)) {
     try {
-        $claudeJson = Get-Content $claudeJsonPath -Raw | ConvertFrom-Json
-        if (-not $claudeJson.projects) {
-            $claudeJson | Add-Member -NotePropertyName "projects" -NotePropertyValue ([pscustomobject]@{}) -Force
-        }
+        # String-index approach — ConvertFrom-Json fails on duplicate keys in .claude.json
+        $raw = [System.IO.File]::ReadAllText($claudeJsonPath)
         $modified = $false
         foreach ($cwd in $claudeCwds) {
-            $existing = $claudeJson.projects.PSObject.Properties[$cwd]
-            if ($existing) {
-                if (-not $existing.Value.hasTrustDialogAccepted) {
-                    $existing.Value.hasTrustDialogAccepted = $true
+            $searchKey = "`"$cwd`""
+            $keyIdx = $raw.IndexOf($searchKey)
+            if ($keyIdx -ge 0) {
+                # Path exists — fix trust flags within the next 1000 chars
+                $sub = $raw.Substring($keyIdx, [Math]::Min(1000, $raw.Length - $keyIdx))
+                $trustStr = '"hasTrustDialogAccepted": false'
+                $tidx = $sub.IndexOf($trustStr)
+                if ($tidx -ge 0) {
+                    $absIdx = $keyIdx + $tidx
+                    $raw = $raw.Remove($absIdx, $trustStr.Length).Insert($absIdx, '"hasTrustDialogAccepted": true')
                     $modified = $true
                 }
-                if (-not $existing.Value.hasCompletedProjectOnboarding) {
-                    $existing.Value.hasCompletedProjectOnboarding = $true
+                $sub = $raw.Substring($keyIdx, [Math]::Min(1000, $raw.Length - $keyIdx))
+                $onboardStr = '"hasCompletedProjectOnboarding": false'
+                $oidx = $sub.IndexOf($onboardStr)
+                if ($oidx -ge 0) {
+                    $absIdx = $keyIdx + $oidx
+                    $raw = $raw.Remove($absIdx, $onboardStr.Length).Insert($absIdx, '"hasCompletedProjectOnboarding": true')
                     $modified = $true
                 }
             } else {
-                $entry = [pscustomobject]@{
-                    allowedTools = @()
-                    mcpContextUris = @()
-                    mcpServers = [pscustomobject]@{}
-                    enabledMcpjsonServers = @()
-                    disabledMcpjsonServers = @()
-                    hasTrustDialogAccepted = $true
-                    projectOnboardingSeenCount = 0
-                    hasClaudeMdExternalIncludesApproved = $false
-                    hasClaudeMdExternalIncludesWarningShown = $false
-                    hasCompletedProjectOnboarding = $true
+                # Path doesn't exist — insert new entry inside "projects"
+                $projIdx = $raw.IndexOf('"projects"')
+                if ($projIdx -ge 0) {
+                    $braceIdx = $raw.IndexOf('{', $projIdx) + 1
+                    $newEntry = "`n    `"$cwd`": {`"allowedTools`":[],`"mcpContextUris`":[],`"mcpServers`":{},`"enabledMcpjsonServers`":[],`"disabledMcpjsonServers`":[],`"hasTrustDialogAccepted`":true,`"projectOnboardingSeenCount`":0,`"hasClaudeMdExternalIncludesApproved`":false,`"hasClaudeMdExternalIncludesWarningShown`":false,`"hasCompletedProjectOnboarding`":true},"
+                    $raw = $raw.Insert($braceIdx, $newEntry)
+                    $modified = $true
                 }
-                $claudeJson.projects | Add-Member -NotePropertyName $cwd -NotePropertyValue $entry -Force
-                $modified = $true
             }
         }
         if ($modified) {
-            $claudeJson | ConvertTo-Json -Depth 10 | Set-Content $claudeJsonPath -Encoding UTF8
+            [System.IO.File]::WriteAllText($claudeJsonPath, $raw, [System.Text.Encoding]::UTF8)
             if (-not $Silent) {
                 Write-Host "Pre-trusted $($claudeCwds.Count) workspace(s) for Claude Code" -ForegroundColor DarkGray
             }
@@ -214,6 +339,27 @@ if ($claudeNodes -and (Test-Path $claudeSessionsDir)) {
     }
 }
 
+# ── Exclude tabs by session name (from config) ──
+$excludeNames = @()
+if ($config.excludeSessionNames) { $excludeNames = @($config.excludeSessionNames) }
+
+# ── Dedup: if the save file has the same sessionId in multiple windows, keep only the first ──
+$seenSessionIds = @{}
+foreach ($win in $session.windows) {
+    $deduped = @()
+    foreach ($tab in $win.tabs) {
+        if ($tab.type -eq 'claude' -and $tab.sessionId) {
+            if ($seenSessionIds[$tab.sessionId]) {
+                if (-not $Silent) { Write-Host "  Dedup: skipping duplicate sessionId $($tab.sessionId)" -ForegroundColor DarkYellow }
+                continue
+            }
+            $seenSessionIds[$tab.sessionId] = $true
+        }
+        $deduped += $tab
+    }
+    $win.tabs = $deduped
+}
+
 if (-not $Silent) {
     Write-Host "Restoring workspace from $($session.savedAt)..." -ForegroundColor Cyan
     Write-Host "  $($session.windows.Count) window(s)" -ForegroundColor DarkGray
@@ -223,7 +369,7 @@ if (-not $Silent) {
 # SPLASH SCREEN — runs on a separate STA runspace
 # ══════════════════════════════════════════════════════════════
 
-$splashState = [hashtable]::Synchronized(@{ phase = 'loading'; angle = 0 })
+$splashState = [hashtable]::Synchronized(@{ phase = 'loading'; angle = 0; ready = $false })
 
 $splashRunspace = [runspacefactory]::CreateRunspace()
 $splashRunspace.ApartmentState = 'STA'
@@ -234,147 +380,104 @@ $splashRunspace.SessionStateProxy.SetVariable('splashState', $splashState)
 $splashPS = [powershell]::Create()
 $splashPS.Runspace = $splashRunspace
 [void]$splashPS.AddScript({
-    Add-Type -AssemblyName System.Windows.Forms
-    Add-Type -AssemblyName System.Drawing
+    try {
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    } catch { $splashState.ready = $true; return }
 
-    $screen = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+    # Span entire virtual screen (all monitors) so splash covers everything
+    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $sw = $vs.Width; $sh = $vs.Height; $sx = $vs.X; $sy = $vs.Y
 
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'Cryosave'
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-    $form.WindowState = [System.Windows.Forms.FormWindowState]::Normal
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
-    $form.Location = New-Object System.Drawing.Point(0, 0)
-    $form.Size = New-Object System.Drawing.Size($screen.Width, $screen.Height)
+    $form.Location = New-Object System.Drawing.Point($sx, $sy)
+    $form.Size = New-Object System.Drawing.Size($sw, $sh)
     $form.TopMost = $true
-    $form.BackColor = [System.Drawing.Color]::FromArgb(15, 20, 35)
-    $form.DoubleBuffered = $true
     $form.ShowInTaskbar = $false
+
+    # Enable all WinForms double-buffer flags to eliminate flicker
+    $flags = [System.Windows.Forms.ControlStyles]::AllPaintingInWmPaint -bor
+              [System.Windows.Forms.ControlStyles]::UserPaint -bor
+              [System.Windows.Forms.ControlStyles]::OptimizedDoubleBuffer
+    $form.GetType().GetMethod('SetStyle', [System.Reflection.BindingFlags]'Instance,NonPublic').Invoke($form, @($flags, $true))
+
+    # Pre-allocate persistent back buffer (avoids per-frame allocation)
+    $script:backBuf = New-Object System.Drawing.Bitmap($sw, $sh)
+    $script:bg = [System.Drawing.Graphics]::FromImage($script:backBuf)
+    $script:bg.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
+
+    # Pre-create reusable drawing objects
+    $bgColor = [System.Drawing.Color]::FromArgb(15, 20, 35)
+    $script:bgBrush = New-Object System.Drawing.SolidBrush($bgColor)
+    $script:ringPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(0, 180, 235), 10.0)
+    $script:ringPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $script:ringPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $script:checkPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(0, 200, 120), 8.0)
+    $script:checkPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $script:checkPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
+    $script:checkPen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
+    $script:textFont = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Regular)
+    $script:textBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 180, 200, 220))
+    $script:textFmt = New-Object System.Drawing.StringFormat
+    $script:textFmt.Alignment = [System.Drawing.StringAlignment]::Center
+
+    $cx = [float]($sw / 2); $cy = [float]($sh / 2)
+    $ringRect = New-Object System.Drawing.RectangleF(($cx - 70), ($cy - 70), 140, 140)
 
     # State
     $script:angle = 0
     $script:doneHoldFrames = 0
     $script:fadeOpacity = 1.0
 
-    # Paint handler
     $form.Add_Paint({
         param($s, $e)
-        $g = $e.Graphics
-        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::HighQuality
-        $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
-        $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+        $g = $script:bg
 
-        $cx = $form.Width / 2
-        $cy = $form.Height / 2
+        # Clear only — no separate background erase (AllPaintingInWmPaint handles this)
+        $g.FillRectangle($script:bgBrush, 0, 0, $sw, $sh)
 
         $phase = $splashState.phase
 
         if ($phase -eq 'loading') {
-            # ── Draw large snowflake ──
-            $iceBlue = [System.Drawing.Color]::FromArgb(0, 180, 235)
-            $pen = New-Object System.Drawing.Pen($iceBlue, 3.0)
-            $branchPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(100, 210, 255), 2.0)
-            $r = 60
-
-            for ($i = 0; $i -lt 6; $i++) {
-                $a = [Math]::PI / 3 * $i
-                $x2 = $cx + [Math]::Cos($a) * $r
-                $y2 = $cy + [Math]::Sin($a) * $r
-                $g.DrawLine($pen, [float]$cx, [float]$cy, [float]$x2, [float]$y2)
-
-                # Main branches
-                $bx = $cx + [Math]::Cos($a) * ($r * 0.55)
-                $by = $cy + [Math]::Sin($a) * ($r * 0.55)
-                $bl = $r * 0.35
-                $g.DrawLine($branchPen, [float]$bx, [float]$by,
-                    [float]($bx + [Math]::Cos($a + 0.7) * $bl), [float]($by + [Math]::Sin($a + 0.7) * $bl))
-                $g.DrawLine($branchPen, [float]$bx, [float]$by,
-                    [float]($bx + [Math]::Cos($a - 0.7) * $bl), [float]($by + [Math]::Sin($a - 0.7) * $bl))
-
-                # Outer branches
-                $ox = $cx + [Math]::Cos($a) * ($r * 0.8)
-                $oy = $cy + [Math]::Sin($a) * ($r * 0.8)
-                $ol = $r * 0.25
-                $g.DrawLine($branchPen, [float]$ox, [float]$oy,
-                    [float]($ox + [Math]::Cos($a + 0.6) * $ol), [float]($oy + [Math]::Sin($a + 0.6) * $ol))
-                $g.DrawLine($branchPen, [float]$ox, [float]$oy,
-                    [float]($ox + [Math]::Cos($a - 0.6) * $ol), [float]($oy + [Math]::Sin($a - 0.6) * $ol))
-            }
-            $pen.Dispose()
-            $branchPen.Dispose()
-
-            # ── Spinning donut ring ──
-            $ringPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(0, 180, 235), 5.0)
-            $ringPen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
-            $ringPen.EndCap = [System.Drawing.Drawing2D.LineCap]::Round
-            $ringRect = New-Object System.Drawing.RectangleF(($cx - 90), ($cy - 90), 180, 180)
-            $g.DrawArc($ringPen, $ringRect, $script:angle, 120)
-            $ringPen.Dispose()
-
-            # ── Faint trail arc ──
-            $trailPen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(40, 0, 180, 235), 3.0)
-            $g.DrawArc($trailPen, $ringRect, ($script:angle + 120), 60)
-            $trailPen.Dispose()
-
-            # ── "Restoring..." text below ──
-            $font = New-Object System.Drawing.Font('Segoe UI', 14, [System.Drawing.FontStyle]::Regular)
-            $brush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(150, 180, 200, 220))
-            $sf = New-Object System.Drawing.StringFormat
-            $sf.Alignment = [System.Drawing.StringAlignment]::Center
-            $g.DrawString('Restoring workspace...', $font, $brush, [float]$cx, [float]($cy + 120), $sf)
-            $font.Dispose(); $brush.Dispose(); $sf.Dispose()
+            $g.DrawArc($script:ringPen, $ringRect, $script:angle, 120)
+            $g.DrawString('Restoring workspace...', $script:textFont, $script:textBrush, $cx, ($cy + 100), $script:textFmt)
 
         } elseif ($phase -eq 'done' -or $phase -eq 'fade') {
-            # ── "DONE" text with yellow fill + black outline ──
-            $path = New-Object System.Drawing.Drawing2D.GraphicsPath
-            $fontFamily = New-Object System.Drawing.FontFamily('Segoe UI')
-            $sf = New-Object System.Drawing.StringFormat
-            $sf.Alignment = [System.Drawing.StringAlignment]::Center
-            $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
-            $textRect = New-Object System.Drawing.RectangleF(($cx - 300), ($cy - 80), 600, 160)
-            $path.AddString('DONE', $fontFamily, [int][System.Drawing.FontStyle]::Bold, 110, $textRect, $sf)
-
-            # Black outline
-            $outlinePen = New-Object System.Drawing.Pen([System.Drawing.Color]::Black, 6)
-            $outlinePen.LineJoin = [System.Drawing.Drawing2D.LineJoin]::Round
-            $g.DrawPath($outlinePen, $path)
-
-            # Yellow fill
-            $fillBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::Gold)
-            $g.FillPath($fillBrush, $path)
-
-            $outlinePen.Dispose(); $fillBrush.Dispose(); $path.Dispose()
-            $fontFamily.Dispose(); $sf.Dispose()
+            $g.DrawArc($script:ringPen, $ringRect, 0, 360)
+            $g.DrawLine($script:checkPen, ($cx - 30), $cy, ($cx - 5), ($cy + 28))
+            $g.DrawLine($script:checkPen, ($cx - 5), ($cy + 28), ($cx + 35), ($cy - 25))
+            $g.DrawString('Done', $script:textFont, $script:textBrush, $cx, ($cy + 100), $script:textFmt)
         }
+
+        # Single
+        $e.Graphics.DrawImageUnscaled($script:backBuf, 0, 0)
     })
 
-    # Animation timer — 50ms = 20fps
     $timer = New-Object System.Windows.Forms.Timer
-    $timer.Interval = 50
+    $timer.Interval = 33  # ~30fps for smoother animation
     $timer.Add_Tick({
         $phase = $splashState.phase
 
         if ($phase -eq 'loading') {
-            $script:angle = ($script:angle + 8) % 360
+            $script:angle = ($script:angle + 6) % 360
             $form.Invalidate()
         }
         elseif ($phase -eq 'done') {
             $script:doneHoldFrames++
-            $form.Invalidate()
-            # Hold DONE for ~800ms (16 frames at 50ms)
-            if ($script:doneHoldFrames -ge 16) {
-                $splashState.phase = 'fade'
-            }
+            if ($script:doneHoldFrames -eq 1) { $form.Invalidate() }  # Draw once, no repeated invalidation
+            if ($script:doneHoldFrames -ge 24) { $splashState.phase = 'fade' }
         }
         elseif ($phase -eq 'fade') {
-            $script:fadeOpacity -= 0.07
+            $script:fadeOpacity -= 0.05
             if ($script:fadeOpacity -le 0) {
                 $timer.Stop()
                 $form.Close()
                 return
             }
             $form.Opacity = [Math]::Max(0, $script:fadeOpacity)
-            $form.Invalidate()
         }
         elseif ($phase -eq 'close') {
             $timer.Stop()
@@ -382,18 +485,51 @@ $splashPS.Runspace = $splashRunspace
         }
     })
 
-    $form.Add_Shown({ $timer.Start() })
+    $form.Add_Shown({ $timer.Start(); $splashState.ready = $true })
+    $form.Add_FormClosed({
+        # Cleanup persistent resources
+        try { $script:bg.Dispose() } catch { }
+        try { $script:backBuf.Dispose() } catch { }
+        try { $script:ringPen.Dispose() } catch { }
+        try { $script:checkPen.Dispose() } catch { }
+        try { $script:textFont.Dispose() } catch { }
+        try { $script:textBrush.Dispose() } catch { }
+        try { $script:textFmt.Dispose() } catch { }
+        try { $script:bgBrush.Dispose() } catch { }
+    })
     [System.Windows.Forms.Application]::Run($form)
 })
 
 $splashHandle = $splashPS.BeginInvoke()
 
-# Brief pause to let splash render first frame
-Start-Sleep -Milliseconds 300
+# Wait for splash to be fully rendered before launching windows behind it
+$waitMs = 0
+while (-not $splashState.ready -and $waitMs -lt 2000) {
+    Start-Sleep -Milliseconds 50
+    $waitMs += 50
+}
+
+# Apply configured restore delay (gives splash time to fully cover screen)
+$restoreDelay = $config.restoreDelayMs
+if ($restoreDelay -and $restoreDelay -gt 0) {
+    Start-Sleep -Milliseconds $restoreDelay
+}
 
 # ══════════════════════════════════════════════════════════════
 # RESTORE: Launch windows with inline positioning
 # ══════════════════════════════════════════════════════════════
+
+# Detect if monitor layout changed — if so, remap window positions
+$currentLayout = Get-MonitorLayout
+$needsRemap = $false
+if ($session.monitorFingerprint -and $session.monitorFingerprint -ne $currentLayout.fingerprint) {
+    $needsRemap = $true
+    if (-not $Silent) {
+        Write-Host "Monitor layout changed — remapping window positions" -ForegroundColor Yellow
+        Write-Host "  Saved:   $($session.monitorFingerprint)" -ForegroundColor DarkGray
+        Write-Host "  Current: $($currentLayout.fingerprint)" -ForegroundColor DarkGray
+    }
+}
 
 $windowMeta = @()
 $winIdx = 0
@@ -411,10 +547,27 @@ foreach ($win in $session.windows) {
             if (-not $Silent) { Write-Host "  Skipping already-running: $($tab.sessionName)" -ForegroundColor DarkGray }
             continue
         }
+        if ($tab.sessionName -and $tab.sessionName -in $excludeNames) {
+            $skippedTabs++
+            if (-not $Silent) { Write-Host "  Skipping excluded: $($tab.sessionName)" -ForegroundColor DarkGray }
+            continue
+        }
         $tabsToRestore += $tab
     }
 
     if ($tabsToRestore.Count -eq 0) { continue }
+
+    # Skip windows with only generic shell tabs (no session, no meaningful content)
+    $hasMeaningful = $false
+    foreach ($t in $tabsToRestore) {
+        if ($t.sessionId -or $t.sessionName -or $t.type -eq 'ssh' -or $t.type -eq 'claude') {
+            $hasMeaningful = $true; break
+        }
+    }
+    if (-not $hasMeaningful) {
+        if (-not $Silent) { Write-Host "  Skipping window $winIdx (only generic shell tabs)" -ForegroundColor DarkGray }
+        continue
+    }
 
     if (-not $Silent) {
         Write-Host "`nWindow $winIdx ($($tabsToRestore.Count) tab(s)):" -ForegroundColor White
@@ -432,7 +585,15 @@ foreach ($win in $session.windows) {
     # Detect the new window and position it immediately
     $newHwnd = Wait-NewWindow $beforeHwnds 2500
     if ($newHwnd) {
-        $p = $win.position
+        # Determine position: remap if layout changed, else use raw coords
+        if ($needsRemap -and $win.relativePosition) {
+            $p = Get-RemappedPosition $win $session.monitors $currentLayout.monitors
+            if (-not $Silent) { Write-Host "  Remapped from monitor $($win.monitorIndex)" -ForegroundColor DarkYellow }
+        } else {
+            $p = @{ left = $win.position.left; top = $win.position.top; width = $win.position.width; height = $win.position.height }
+        }
+        # Always clamp to visible screen bounds (safety net for v1 saves too)
+        $p = Clamp-ToScreen $p
         [WinApi]::MoveWindow($newHwnd, $p.left, $p.top, $p.width, $p.height)
         if (-not $Silent) {
             Write-Host "  Positioned: ($($p.left),$($p.top)) $($p.width)x$($p.height)" -ForegroundColor DarkGreen
@@ -454,8 +615,8 @@ foreach ($win in $session.windows) {
 
     $windowMeta += @{ windowId = $windowId; title = $win.title }
 
-    # Small gap between windows
-    Start-Sleep -Milliseconds 200
+    # Longer gap between windows to prevent HWND race conditions
+    Start-Sleep -Milliseconds 800
 }
 
 # ══════════════════════════════════════════════════════════════

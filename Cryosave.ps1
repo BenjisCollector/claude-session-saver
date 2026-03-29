@@ -9,16 +9,25 @@
 
 $ErrorActionPreference = 'Continue'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$script:CryosaveVersion = '1.4.0'
+$script:CryosaveVersion = '1.6.0'
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName Microsoft.VisualBasic
 
 # DPI awareness — ensures GetWindowRect and Screen.Bounds use the same coordinate space
-if (-not ([System.Management.Automation.PSTypeName]'DpiHelper').Type) {
-    Add-Type -TypeDefinition 'using System.Runtime.InteropServices; public class DpiHelper { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }'
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'DpiHelper').Type) {
+        Add-Type -IgnoreWarnings -TypeDefinition 'using System.Runtime.InteropServices; public class DpiHelper { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }' -ErrorAction Stop
+    }
+    [DpiHelper]::SetProcessDPIAware() | Out-Null
+} catch {
+    # Fallback: call SetProcessDPIAware directly via WinApi if Add-Type fails (missing SDK paths)
+    try {
+        Add-Type -IgnoreWarnings -Name DpiFallback -Namespace Cryosave -MemberDefinition '[DllImport("user32.dll")] public static extern bool SetProcessDPIAware();' -ErrorAction SilentlyContinue
+        [Cryosave.DpiFallback]::SetProcessDPIAware() | Out-Null
+    } catch { }
 }
-[DpiHelper]::SetProcessDPIAware() | Out-Null
 
 . "$root\lib\WinApi.ps1"
 
@@ -325,22 +334,51 @@ $tray.Visible = $true
 function Invoke-Save {
     try {
         $saveScript = Join-Path $root 'Freeze.ps1'
-        Start-Process powershell.exe -ArgumentList @(
-            '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
-            '-File', $saveScript, '-Silent'
-        ) -WindowStyle Hidden
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'powershell.exe'
+        $psi.Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$saveScript`" -Silent"
+        $psi.CreateNoWindow = $true
+        $psi.UseShellExecute = $false
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
     } catch {
         $tray.ShowBalloonTip(3000, 'Error', "Save failed: $_", [System.Windows.Forms.ToolTipIcon]::Error)
     }
 }
 
+function Invoke-SaveWorkspace([string]$Name) {
+    try {
+        $saveScript = Join-Path $root 'Freeze.ps1'
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'powershell.exe'
+        $psi.Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$saveScript`" -Silent -Workspace `"$Name`""
+        $psi.CreateNoWindow = $true
+        $psi.UseShellExecute = $false
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
+        $tray.ShowBalloonTip(2000, 'Cryosave', "Workspace '$Name' saved", [System.Windows.Forms.ToolTipIcon]::Info)
+    } catch {
+        $tray.ShowBalloonTip(3000, 'Error', "Workspace save failed: $_", [System.Windows.Forms.ToolTipIcon]::Error)
+    }
+}
+
+function Invoke-RestoreWorkspace([string]$Name) {
+    $restoreScript = Join-Path $root 'Thaw.ps1'
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$restoreScript`" -Silent -Workspace `"$Name`""
+    $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false
+    [System.Diagnostics.Process]::Start($psi) | Out-Null
+}
+
 function Invoke-SaveAndClose {
     try {
         $saveScript = Join-Path $root 'Freeze.ps1'
-        Start-Process powershell.exe -ArgumentList @(
-            '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden',
-            '-File', $saveScript, '-Silent', '-Close'
-        ) -WindowStyle Hidden
+        $psi = New-Object System.Diagnostics.ProcessStartInfo
+        $psi.FileName = 'powershell.exe'
+        $psi.Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$saveScript`" -Silent -Close"
+        $psi.CreateNoWindow = $true
+        $psi.UseShellExecute = $false
+        [System.Diagnostics.Process]::Start($psi) | Out-Null
     } catch {
         $tray.ShowBalloonTip(3000, 'Error', "Save failed: $_", [System.Windows.Forms.ToolTipIcon]::Error)
     }
@@ -649,11 +687,83 @@ $restoreItem.Add_Click({
         return
     }
     $restoreScript = Join-Path $root 'Thaw.ps1'
-    Start-Process powershell.exe -ArgumentList @(
-        '-ExecutionPolicy', 'Bypass', '-File', $restoreScript
-    )
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = 'powershell.exe'
+    $psi.Arguments = "-ExecutionPolicy Bypass -WindowStyle Hidden -File `"$restoreScript`" -Silent"
+    $psi.CreateNoWindow = $true
+    $psi.UseShellExecute = $false
+    [System.Diagnostics.Process]::Start($psi) | Out-Null
 })
 $menu.Items.Add($restoreItem) | Out-Null
+
+# ── Workspaces submenu ──
+
+$wsMenu = New-Object System.Windows.Forms.ToolStripMenuItem('Workspaces')
+$wsMenu.ToolTipText = 'Save and restore named workspace profiles'
+
+# Populate dynamically when menu opens
+$menu.Add_Opening({
+    $wsMenu.DropDownItems.Clear()
+    $wsDir = Join-Path $root 'saves\workspaces'
+
+    # "Save as new..." item
+    $newItem = New-Object System.Windows.Forms.ToolStripMenuItem('Save as new...')
+    $newItem.Add_Click({
+        $name = [Microsoft.VisualBasic.Interaction]::InputBox('Workspace name (e.g., "work", "home"):', 'Cryosave — New Workspace', '')
+        if ($name) {
+            $safeName = $name -replace '[\\/:*?"<>|]', '-'
+            Invoke-SaveWorkspace $safeName
+        }
+    })
+    $wsMenu.DropDownItems.Add($newItem) | Out-Null
+
+    # Existing workspaces
+    if (Test-Path $wsDir) {
+        $wsFiles = Get-ChildItem -Path $wsDir -Filter "*.json" -ErrorAction SilentlyContinue | Sort-Object Name
+        if ($wsFiles.Count -gt 0) {
+            $wsMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+            foreach ($wsf in $wsFiles) {
+                $wsName = $wsf.BaseName
+                # Read monitor summary
+                $monSummary = ''
+                try {
+                    $wsData = Get-Content $wsf.FullName -Raw | ConvertFrom-Json
+                    if ($wsData.monitors) {
+                        $monSummary = ' [' + (($wsData.monitors | ForEach-Object { "$($_.width)x$($_.height)" }) -join ' + ') + ']'
+                    }
+                } catch { }
+
+                # Save over existing
+                $saveOver = New-Object System.Windows.Forms.ToolStripMenuItem("Save `"$wsName`"")
+                $saveOver.Tag = $wsName
+                $saveOver.Add_Click({ Invoke-SaveWorkspace $this.Tag })
+                $wsMenu.DropDownItems.Add($saveOver) | Out-Null
+
+                # Restore
+                $restWs = New-Object System.Windows.Forms.ToolStripMenuItem("Restore `"$wsName`"$monSummary")
+                $restWs.Tag = $wsName
+                $restWs.Add_Click({ Invoke-RestoreWorkspace $this.Tag })
+                $wsMenu.DropDownItems.Add($restWs) | Out-Null
+            }
+
+            $wsMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+            foreach ($wsf in $wsFiles) {
+                $wsName = $wsf.BaseName
+                $delItem = New-Object System.Windows.Forms.ToolStripMenuItem("Delete `"$wsName`"")
+                $delItem.Tag = $wsf.FullName
+                $delItem.Add_Click({
+                    $confirm = [System.Windows.Forms.MessageBox]::Show("Delete workspace?", 'Cryosave', 'YesNo', 'Question')
+                    if ($confirm -eq 'Yes') { Remove-Item $this.Tag -Force -ErrorAction SilentlyContinue }
+                })
+                $wsMenu.DropDownItems.Add($delItem) | Out-Null
+            }
+        }
+    }
+})
+
+$menu.Items.Add($wsMenu) | Out-Null
 
 $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
 

@@ -17,12 +17,69 @@
 #>
 param(
     [switch]$Silent,
-    [switch]$Close
+    [switch]$Close,
+    [string]$Workspace
 )
 
 $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 . "$root\lib\WinApi.ps1"
+
+# DPI awareness — must be called before any Screen or GetWindowRect usage
+try {
+    if (-not ([System.Management.Automation.PSTypeName]'DpiHelper').Type) {
+        Add-Type -IgnoreWarnings -TypeDefinition 'using System.Runtime.InteropServices; public class DpiHelper { [DllImport("user32.dll")] public static extern bool SetProcessDPIAware(); }' -ErrorAction SilentlyContinue
+    }
+    [DpiHelper]::SetProcessDPIAware() | Out-Null
+} catch { }
+
+Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+
+# ── Monitor layout detection ──
+
+function Get-MonitorLayout {
+    $screens = [System.Windows.Forms.Screen]::AllScreens | Sort-Object { $_.Bounds.X }, { $_.Bounds.Y }
+    $monitors = @()
+    $idx = 0
+    foreach ($scr in $screens) {
+        $b = $scr.Bounds
+        $monitors += @{
+            index      = $idx
+            deviceName = $scr.DeviceName
+            left       = $b.X
+            top        = $b.Y
+            width      = $b.Width
+            height     = $b.Height
+            primary    = [bool]$scr.Primary
+        }
+        $idx++
+    }
+    $fp = ($monitors | ForEach-Object { "$($_.width)x$($_.height)@$($_.left),$($_.top)" }) -join '|'
+    return @{ monitors = $monitors; fingerprint = $fp }
+}
+
+function Get-WindowMonitorInfo($winLeft, $winTop, $winWidth, $winHeight, $monitors) {
+    $centerX = $winLeft + $winWidth / 2
+    $centerY = $winTop + $winHeight / 2
+    $monIdx = 0
+    foreach ($m in $monitors) {
+        if ($centerX -ge $m.left -and $centerX -lt ($m.left + $m.width) -and
+            $centerY -ge $m.top  -and $centerY -lt ($m.top + $m.height)) {
+            $monIdx = $m.index; break
+        }
+    }
+    $ownerMon = $monitors | Where-Object { $_.index -eq $monIdx }
+    if (-not $ownerMon) { $ownerMon = $monitors[0] }
+    $relPos = @{
+        leftPct   = [Math]::Round(($winLeft - $ownerMon.left) / $ownerMon.width, 4)
+        topPct    = [Math]::Round(($winTop - $ownerMon.top) / $ownerMon.height, 4)
+        widthPct  = [Math]::Round($winWidth / $ownerMon.width, 4)
+        heightPct = [Math]::Round($winHeight / $ownerMon.height, 4)
+    }
+    return @{ monitorIndex = $monIdx; relativePosition = $relPos }
+}
+
+$monitorLayout = Get-MonitorLayout
 
 $config = Get-Content "$root\config.json" -Raw | ConvertFrom-Json
 $savesDir = Join-Path $root "saves"
@@ -76,6 +133,9 @@ $ocShells = $allProcs | Where-Object {
     $_.ParentProcessId -in $ocPids -and $_.Name -ne "OpenConsole.exe"
 }
 if ($ocShells) { $shells = @($shells) + @($ocShells) }
+
+# Sort shells by PID for deterministic tab ordering (CIM returns in undefined order)
+$shells = $shells | Sort-Object -Property ProcessId
 
 # Collect descendants up to 3 levels deep (handles nested bash > bash > node patterns)
 $shellPids = $shells | ForEach-Object { $_.ProcessId }
@@ -155,6 +215,12 @@ foreach ($shell in $shells) {
                 }
             }
 
+            # Override sessionName from shell's --name arg if present
+            # (session file name can be wrong when --continue resumed a different session)
+            if ($shell.CommandLine -match "--name\s+'([^']+)'") {
+                $tab["sessionName"] = $Matches[1]
+            }
+
             # Read model and permissionMode from conversation JSONL
             if ($tab.sessionId) {
                 $claudeProjectsDir = Join-Path $env:USERPROFILE ".claude\projects"
@@ -185,6 +251,28 @@ foreach ($shell in $shells) {
                 }
             }
         }
+        # Fallback: shell's CommandLine contains "claude" but no node.exe child (idle/exited session)
+        elseif ($tab.type -eq "powershell" -and $shell.CommandLine -match "claude") {
+            $tab.type = "claude"
+            # Try to extract --resume sessionId from the shell's launch command
+            if ($shell.CommandLine -match '--resume\s+([0-9a-f-]{36})') {
+                $resumeId = $Matches[1]
+                $tab["sessionId"] = $resumeId
+                # Find the JSONL to get sessionName
+                $claudeProjectsDir = Join-Path $env:USERPROFILE ".claude\projects"
+                if (Test-Path $claudeProjectsDir) {
+                    $jsonlFile = Get-ChildItem -Path $claudeProjectsDir -Recurse -Filter "$resumeId.jsonl" -ErrorAction SilentlyContinue | Select-Object -First 1
+                    if ($jsonlFile) {
+                        $projFolder = $jsonlFile.Directory.Name
+                        $projPath = $projFolder -replace '--', ':\' -replace '-', '\'
+                        if (Test-Path $projPath) { $tab.cwd = $projPath }
+                    }
+                }
+            }
+            elseif ($shell.CommandLine -match "--name\s+'([^']+)'") {
+                $tab["sessionName"] = $Matches[1]
+            }
+        }
         } # end SSH else
 
         # CWD fallback chain: JSONL project path > node.exe PEB > shell PEB
@@ -206,6 +294,10 @@ foreach ($shell in $shells) {
 
     $tabs += $tab
 }
+
+# ── Load exclude names for window-level exclusion later ──
+$excludeNames = @()
+if ($config.excludeSessionNames) { $excludeNames = @($config.excludeSessionNames) }
 
 # ── Group tabs into windows using UI Automation ──
 # The old approach matched only against window titles, which show only the ACTIVE tab.
@@ -258,6 +350,11 @@ function Get-TabMatchScore($tab, [string]$uiaName) {
         if ($folder.Length -gt 1 -and $folder -ne $homeName -and $u.Contains($folder)) { return 50 }
     }
 
+    # Claude with non-home CWD (moderate — project-specific but no folder name match)
+    if ($tab.type -eq "claude" -and $tab.cwd -and $tab.cwd -ne $env:USERPROFILE) {
+        if ($u.Contains("claude")) { return 15 }
+    }
+
     # Generic type match (weak fallback)
     if ($tab.type -eq "claude" -and $u.Contains("claude")) { return 10 }
     if ($tab.type -eq "powershell" -and ($u.Contains("powershell") -or $u.Contains("pwsh"))) { return 5 }
@@ -266,7 +363,8 @@ function Get-TabMatchScore($tab, [string]$uiaName) {
 }
 
 # Filter out off-screen / hidden helper windows (position < -10000)
-$visibleWindows = $windows | Where-Object { $_.Position.left -gt -10000 -and $_.Position.top -gt -10000 }
+# Sort by HWND for deterministic window ordering (EnumWindows order is undefined)
+$visibleWindows = $windows | Where-Object { $_.Position.left -gt -10000 -and $_.Position.top -gt -10000 } | Sort-Object -Property { $_.Hwnd.ToInt64() }
 
 # Enumerate UIA tab names per window
 $windowUiaTabs = @{}
@@ -302,13 +400,24 @@ if ($uiaAvailable) {
         }
     }
 
-    # Sort highest score first — strongest matches get priority
-    $candidates = $candidates | Sort-Object -Property score -Descending
+    # Sort highest score first with stable tiebreakers (PowerShell Sort-Object is unstable)
+    $candidates = $candidates | Sort-Object -Property @(
+        @{ Expression = { $_.score }; Descending = $true }
+        @{ Expression = { $_.wi }; Descending = $false }
+        @{ Expression = { $_.ui }; Descending = $false }
+        @{ Expression = { $_.ti }; Descending = $false }
+    )
     $uiaClaimed = @{}  # "wi:ui" -> true (each UIA slot takes one tab)
+
+    # Process-tree validation: when multiple WT processes exist, tabs can only match
+    # windows owned by their parent WT process (ground-truth from process tree)
+    $multiWt = (($wtPids | Select-Object -Unique).Count -gt 1)
 
     foreach ($c in $candidates) {
         $uiaKey = "$($c.wi):$($c.ui)"
         if ($claimed[$c.ti] -or $uiaClaimed[$uiaKey]) { continue }
+        # If multiple WT processes, enforce process-tree ownership
+        if ($multiWt -and $tabs[$c.ti]._wtPid -ne $visibleWindows[$c.wi].WtPid) { continue }
         $matched[$c.wi] += $tabs[$c.ti]
         $claimed[$c.ti] = $true
         $uiaClaimed[$uiaKey] = $true
@@ -344,19 +453,18 @@ for ($ti = 0; $ti -lt $tabs.Count; $ti++) {
     if (-not $claimed[$ti]) { $unmatched += $tabs[$ti] }
 }
 
-$emptyWindows = @()
-for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) {
-    if ($matched[$wi].Count -eq 0) { $emptyWindows += $wi }
-}
-
-$umi = 0
+# Deterministic distribution: assign to window with fewest tabs, lowest index as tiebreaker
 foreach ($tab in $unmatched) {
-    if ($emptyWindows.Count -gt 0 -and $umi -lt $emptyWindows.Count) {
-        $wi = $emptyWindows[$umi]; $umi++
-    } else {
-        $wi = $umi % $visibleWindows.Count; $umi++
+    $bestWi = 0; $bestCount = [int]::MaxValue
+    for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) {
+        if ($matched[$wi].Count -lt $bestCount) {
+            $bestCount = $matched[$wi].Count; $bestWi = $wi
+        }
     }
-    $matched[$wi] += $tab
+    $matched[$bestWi] += $tab
+    if (-not $Silent) {
+        Write-Host "    Unmatched tab ($($tab.type)) -> Window $($bestWi+1) (fewest tabs=$bestCount)" -ForegroundColor DarkYellow
+    }
 }
 
 # Apply matches
@@ -369,15 +477,77 @@ for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) {
 # Use visible windows only for output (drop hidden/helper windows)
 $windows = $visibleWindows
 
+# ── Post-matching exclusion: remove excluded tabs and their windows ──
+if ($excludeNames.Count -gt 0) {
+    $beforeCount = $windows.Count
+
+    # Step 1: Remove excluded tabs from all windows
+    foreach ($win in $windows) {
+        $cleanTabs = [System.Collections.ArrayList]::new()
+        foreach ($t in $win.Tabs) {
+            $excluded = $false
+            if ($t.sessionName) {
+                foreach ($exName in $excludeNames) {
+                    if ($t.sessionName -eq $exName) { $excluded = $true; break }
+                }
+            }
+            if (-not $excluded) { $cleanTabs.Add($t) | Out-Null }
+        }
+        $win.Tabs = $cleanTabs
+    }
+
+    # Step 2: Drop windows that have UIA tabs matching excluded names
+    # (this catches the actual window even when the tab wasn't matched to it)
+    $windows = @($windows | Where-Object {
+        $dominated = $false
+        for ($wi = 0; $wi -lt $visibleWindows.Count; $wi++) {
+            if ($visibleWindows[$wi].Hwnd -eq $_.Hwnd) {
+                foreach ($uia in $windowUiaTabs[$wi]) {
+                    foreach ($exName in $excludeNames) {
+                        if ($uia -and $uia.ToLower().Contains($exName.ToLower())) { $dominated = $true }
+                    }
+                }
+                break
+            }
+        }
+        # Also check window title
+        if ($_.Title) {
+            foreach ($exName in $excludeNames) {
+                if ($_.Title.ToLower().Contains($exName.ToLower())) { $dominated = $true }
+            }
+        }
+        -not $dominated
+    })
+
+    $dropped = $beforeCount - $windows.Count
+    if (-not $Silent) {
+        $removedTabs = $beforeCount * 0  # just need a number
+        Write-Host "  Exclusion: removed tabs/windows matching [$($excludeNames -join ', ')]" -ForegroundColor DarkGray
+    }
+}
+
 # ── Build output ──
 
 $output = @{
-    savedAt = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
-    windows = @()
+    formatVersion      = 2
+    savedAt            = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
+    workspace          = if ($Workspace) { $Workspace } else { $null }
+    monitors           = $monitorLayout.monitors
+    monitorFingerprint = $monitorLayout.fingerprint
+    windows            = @()
 }
 
 foreach ($win in $windows) {
-    $w = @{ position = $win.Position; title = $win.Title; tabs = @() }
+    if ($win.Tabs.Count -eq 0) { continue }
+    $p = $win.Position
+    $monInfo = Get-WindowMonitorInfo $p.left $p.top $p.width $p.height $monitorLayout.monitors
+    $w = @{
+        position         = $p
+        monitorIndex     = $monInfo.monitorIndex
+        relativePosition = $monInfo.relativePosition
+        title            = $win.Title
+        tabs             = @()
+    }
     foreach ($tab in $win.Tabs) {
         $t = @{ type = $tab.type }
         if ($tab.cwd)            { $t.cwd = $tab.cwd }
@@ -400,6 +570,16 @@ $latestPath = Join-Path $savesDir "latest.json"
 $json = $output | ConvertTo-Json -Depth 10
 [System.IO.File]::WriteAllText($savePath, $json, [System.Text.Encoding]::UTF8)
 [System.IO.File]::WriteAllText($latestPath, $json, [System.Text.Encoding]::UTF8)
+
+# Write workspace file if -Workspace specified
+if ($Workspace) {
+    $wsDir = Join-Path $savesDir "workspaces"
+    if (-not (Test-Path $wsDir)) { New-Item -ItemType Directory -Path $wsDir -Force | Out-Null }
+    $safeName = $Workspace -replace '[\\/:*?"<>|]', '-'
+    $wsPath = Join-Path $wsDir "$safeName.json"
+    [System.IO.File]::WriteAllText($wsPath, $json, [System.Text.Encoding]::UTF8)
+    if (-not $Silent) { Write-Host "Workspace '$safeName' saved" -ForegroundColor Cyan }
+}
 
 # ── Prune old saves ──
 

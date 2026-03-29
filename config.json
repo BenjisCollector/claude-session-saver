@@ -2,5 +2,8 @@
   "maxSaves": 10,
   "restoreDelayMs": 1500,
   "enableToastNotifications": true,
-  "autoSaveMinutes": 5
+  "autoSaveMinutes": 5,
+  "excludeSessionNames": ["cryosave-deterministic-tab-matching"],
+  "defaultWorkspace": null,
+  "autoDetectWorkspace": true
 }
